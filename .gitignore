@@ -1,0 +1,33 @@
+# 公开仓库只发布【项目本体 + README + LICENSE + THIRD-PARTY】。
+# 其余（测试 / 工具 / 开发文档 / 素材）只留在本机，不进版本库。
+
+# —— 本机专用：测试、构建工具、开发文档 ——
+/tests/
+/tools/
+/.github/
+/GITHUB-发布准备.md
+/RPE噪域适配-项目说明.md
+/RPE-blockArea-规范与PhiraPro适配方案.md
+/维护报告-已知问题.md
+/锚点坐标系-交接说明.md
+/噪域导出修复-交接说明.md
+
+# —— 大体积素材 / 中间产物 ——
+*.pez
+WATER.pez
+归档.zip
+respack/
+respack-nomo/
+respack.zip
+*.png
+!docs/*.png
+dist/
+
+# —— 第三方版权素材（谱面 / 教程 PDF）：不入库，本机保留即可 ——
+/ハテ.rNFrums.0__Chart_AT.json
+/ハテ.rNFrums.0__Chart_IN.json
+/0130923863793952.json
+/6534812425272184.json
+/8978036031493959.official.json
+/tests/data/
+/RPE Recorder 噪域制作指南.pdf
