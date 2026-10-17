@@ -3057,6 +3057,38 @@ function rpeWithNoiseLines(doc, lines, areas, opts) {
     return (nf === f) ? L : Object.assign({}, L, { father: nf });
   });
   const chartEnd = (isFinite(o.chartEnd) && o.chartEnd > 0) ? o.chartEnd : 1e6;
+  // ★★ 载体线上的音符：旧噪域线被替换时**不能把它们的 notes 丢掉**（用户实测"note 不见了"）。
+  //   用 recSig（Texture|father|#下标）把旧噪域线映射回噪域，音符归属到该噪域所在的合并组；
+  //   映射不上的（噪域被删/改到对不上）兜底挂到第一条重建线上 —— 仍是 isSubtract 线，
+  //   语义不变（这类线上的音符本就不渲染），但音符总数/时间/位置都不会凭空消失。
+  const notePools = [];           // { area, notes }
+  const orphanNotes = [];
+  for (let i = 0; i < src.length; i++) {
+    const L = src[i];
+    if (recorderSubtractOf(L && L.Texture) < 0) continue;
+    const notes = (L && Array.isArray(L.notes)) ? L.notes : null;
+    if (!notes || !notes.length) continue;
+    let area = null;
+    if (lines && lines[i]) {
+      const sig = recLineSig(lines[i], i);
+      area = (areas || []).find(a => a && a.recSig === sig) || null;
+    }
+    if (area) notePools.push({ area, notes });
+    else orphanNotes.push(...notes);
+  }
+  const notesByArea = new Map();
+  for (const p of notePools) {
+    if (!notesByArea.has(p.area)) notesByArea.set(p.area, []);
+    notesByArea.get(p.area).push(...p.notes);
+  }
+  const attachNotes = (ln, group) => {
+    if (!ln) return;
+    const notes = [];
+    for (const a of group) { const arr = notesByArea.get(a); if (arr) notes.push(...arr); }
+    if (!notes.length) return;
+    ln.notes = (Array.isArray(ln.notes) ? ln.notes : []).concat(notes);
+    ln.numOfNotes = ln.notes.length;
+  };
   const ctx = { lines, oldToNew, chartEnd, aspect: o.aspect };
   const groups = (o.merge === false)
     ? (areas || []).map(a => [a])
@@ -3076,9 +3108,139 @@ function rpeWithNoiseLines(doc, lines, areas, opts) {
     } else {
       ln = buildMergedLine(g, Object.assign({ index: gi }, ctx));
     }
-    if (ln) outLines.push(ln);
+    if (ln) { attachNotes(ln, g); outLines.push(ln); }
   });
+  // 映射不上的旧噪域线音符：挂到第一条重建的噪域线上（保持音符总数）
+  if (orphanNotes.length) {
+    const first = outLines.find(L => recorderSubtractOf(L.Texture) >= 0);
+    if (first) {
+      first.notes = (Array.isArray(first.notes) ? first.notes : []).concat(orphanNotes);
+      first.numOfNotes = first.notes.length;
+    }
+  }
   return Object.assign({}, doc, { judgeLineList: outLines });
+}
+
+
+/* ==================== 官方谱 → RPE 骨架（判定线 + 音符） ====================
+   「导出 RPE」不能只对 RPE 源有效：官方谱导入后 S.doc 只是空壳（judgeLineList: []），
+   直接导出会把判定线/音符全丢掉（用户实测"note 不见了"）。
+   这里把官方 doc 转成 RPE 骨架，单位换算与 buildLines(official) / buildOfficialObj 互逆：
+     · 时间：官方 1/32 拍 → beat（同 buildLines 的 T2B=1/32）；负时间抬到 0，末哨兵裁到谱面末端+1
+     · move：官方归一化 [0,1] → RPE 单位 (v-0.5)*1350 / (v2-0.5)*900
+     · rotate：官方朝向 → RPE 取反（RPE 读入时会再取反回内部朝向）
+     · alpha：0~1 → 0~255
+     · speed：官方值 ×45/10（kRpePerBeat 官方/RPE 系数比，与 buildOfficialObj 的 ×10/45 互逆）
+     · 音符：官方类型 {1:T,2:D,3:H,4:F} → RPE {1:T,4:D,2:H,3:F}；positionX ×75.9375；
+       holdTime 转 beat；RPE 的 isFake 是 number、isGif 是 boolean（Recorder 严格校验）
+     · 缓动一律线性：编辑器导入官方时本就忽略官方 easingType（easing:1），导出=编辑器所见。
+   局限：编辑器按【单一 BPM】建模（取首条线 bpm）；官方多 BPM 谱、逐线 bpm 不在支持范围。 */
+function rpeFromOfficial(doc, opts) {
+  const o = opts || {};
+  const snap = o.snapN || 480;
+  const tri = (b) => bestTriple(Math.max(0, +b || 0), snap);
+  const T2B = 1 / 32;
+  const chartEnd = (isFinite(o.chartEndBeat) && o.chartEndBeat > 0) ? o.chartEndBeat : 1;
+  const endB = chartEnd + 1;
+  const clampB = (b) => Math.max(0, Math.min(endB, b));
+  const mkEv = (t0, t1, v0, v1) => {
+    if (!(t1 > t0 + 1e-9)) return null;
+    return { startTime: tri(t0), endTime: tri(t1), start: v0, end: v1,
+             easingType: 1, bezier: 0, bezierPoints: [0, 0, 0, 0],
+             easingLeft: 0, easingRight: 1, linkgroup: 0 };
+  };
+  const convEvents = (list, f, defV) => {
+    const out = [];
+    for (const e of (list || [])) {
+      const t0 = clampB((+e.startTime || 0) * T2B);
+      const t1 = clampB((+e.endTime || 0) * T2B);
+      const a = (e.start == null ? defV : e.start);
+      const b = (e.end == null ? defV : e.end);
+      const ev = mkEv(t0, t1, f(a), f(b));
+      if (ev) out.push(ev);
+    }
+    if (!out.length) { const ev = mkEv(0, endB, f(defV), f(defV)); if (ev) out.push(ev); }
+    return out;
+  };
+  const X2RPE = (2 * 9 / 160) * (RPE_WIDTH / 2);       // 官方 positionX → RPE 单位
+  const O2R = { 1: 1, 2: 4, 3: 2, 4: 3 };              // 官方音符类型 → RPE 类型
+  const mkNotes = (list, above) => (list || []).map(n => {
+    const t0 = clampB((+n.time || 0) * T2B);
+    const t1 = clampB(((+n.time || 0) + (+n.holdTime || 0)) * T2B);
+    return {
+      startTime: tri(t0), endTime: tri(t1),
+      positionX: (+n.positionX || 0) * X2RPE,
+      above: above ? 1 : 0, type: O2R[n.type | 0] || 1,
+      speed: (n.speed == null ? 1 : +n.speed), size: 1, yOffset: 0,
+      isFake: 0, alpha: 255, visibleTime: 999999,
+    };
+  });
+  const meta = Object.assign({
+    RPEVersion: 160, offset: 0, name: '', id: '', song: '', background: '',
+    composer: '', charter: '', level: '0', illustration: '', duration: 0,
+  }, o.meta || {});
+  meta.RPEVersion = 160;
+  meta.offset = Math.round((+doc.offset || 0) * 1000);
+  if (isFinite(o.duration) && o.duration > 0) meta.duration = o.duration;
+  const bpmList = (Array.isArray(o.bpmList) && o.bpmList.length)
+    ? o.bpmList.map(e => ({ bpm: +e.bpm || 170, startTime: tri(e.beat || 0) }))
+    : [{ bpm: +o.bpm || 170, startTime: [0, 0, 1] }];
+  const rpeLines = [];
+  for (const L of (doc.judgeLineList || [])) {
+    const mv = L.judgeLineMoveEvents || [];
+    const reX = [], reY = [];       // moveX 取 start/end、moveY 取 start2/end2
+    for (const e of mv) {
+      const t0 = clampB((+e.startTime || 0) * T2B), t1 = clampB((+e.endTime || 0) * T2B);
+      const evX = mkEv(t0, t1, (e.start == null ? 0.5 : e.start - 0.5) * RPE_WIDTH,
+                       (e.end == null ? 0.5 : e.end - 0.5) * RPE_WIDTH);
+      const evY = mkEv(t0, t1, (e.start2 == null ? 0.5 : e.start2 - 0.5) * RPE_HEIGHT,
+                       (e.end2 == null ? 0.5 : e.end2 - 0.5) * RPE_HEIGHT);
+      if (evX) reX.push(evX); if (evY) reY.push(evY);
+    }
+    if (!reX.length) reX.push(mkEv(0, endB, 0, 0));
+    if (!reY.length) reY.push(mkEv(0, endB, 0, 0));
+    const rotate = convEvents(L.judgeLineRotateEvents, v => -(v || 0), 0);
+    const alpha = convEvents(L.judgeLineDisappearEvents, v => Math.max(0, Math.min(1, v == null ? 1 : v)) * 255, 1);
+    // ★ 官方 speed 事件用的字段是 value（不是 start/end）→ 单独转换；RPE = 官方值 ×45/10
+    const speed = [];
+    for (const e of (L.speedEvents || [])) {
+      const t0 = clampB((+e.startTime || 0) * T2B), t1 = clampB((+e.endTime || 0) * T2B);
+      const v = (e.value == null ? 1 : +e.value) * (45 / 10);
+      const ev = mkEv(t0, t1, v, v);
+      if (ev) speed.push(ev);
+    }
+    if (!speed.length) { const ev = mkEv(0, endB, 45 / 10, 45 / 10); if (ev) speed.push(ev); }
+    // ★ 首事件晚于 0 拍时补"首事件之前"的一段（值 = 编辑器对官方谱的默认值）：
+    //   移动 0 / 旋转 0 / 透明度 255 / 流速 4.5（= 官方默认 1 ×45/10）。
+    //   否则 RPE 播放器会用它自己的默认值，起始几拍与官方/编辑器不一致。
+    const lead = (evs, v) => {
+      const b = evs.length ? tripleToBeats(evs[0].startTime) : 0;
+      if (b > 1e-9) { const ev = mkEv(0, b, v, v); if (ev) evs.unshift(ev); }
+    };
+    lead(reX, 0); lead(reY, 0); lead(rotate, 0); lead(alpha, 255); lead(speed, 45 / 10);
+    const notes = mkNotes(L.notesAbove, true).concat(mkNotes(L.notesBelow, false));
+    // 音符按时间排序（RPE 谱面的 notes 是时间序；notesAbove / notesBelow 合并后要重排）
+    notes.sort((a, b) => tripleToBeats(a.startTime) - tripleToBeats(b.startTime));
+    const line = {
+      Group: 0,
+      Name: (L.name || ('Line ' + (rpeLines.length + 1))),
+      Texture: 'line.png',
+      alphaControl: [{ x: 0, alpha: 1, easing: 1 }, { x: 9999999, alpha: 1, easing: 1 }],
+      anchor: [0.5, 0.5],
+      bpmfactor: 1,
+      eventLayers: [{ alphaEvents: alpha, moveXEvents: reX, moveYEvents: reY, rotateEvents: rotate, speedEvents: speed }],
+      extended: { inclineEvents: [], scaleXEvents: [], scaleYEvents: [] },
+      father: -1, isCover: 1, isGif: false, numOfNotes: notes.length,
+      posControl: [{ x: 0, pos: 1, easing: 1 }, { x: 9999999, pos: 1, easing: 1 }],
+      sizeControl: [{ x: 0, size: 1, easing: 1 }, { x: 9999999, size: 1, easing: 1 }],
+      skewControl: [{ x: 0, skew: 0, easing: 1 }, { x: 9999999, skew: 0, easing: 1 }],
+      yControl: [{ x: 0, y: 1, easing: 1 }, { x: 9999999, y: 1, easing: 1 }],
+      zOrder: 0,
+    };
+    if (notes.length) line.notes = notes;
+    rpeLines.push(line);
+  }
+  return { META: meta, BPMList: bpmList, judgeLineList: rpeLines };
 }
 
 
@@ -4047,7 +4209,7 @@ const CORE = {
   lineStateAt,
   pezInfoTxt,
   recorderSubtractOf, recorderLifeCycle, recorderLineToArea, areaToRecorderLine, rpeWithNoiseLines,
- packNoiseAreas, packLowerBound, areaSpans, HEIGHT_RATIO, SPEED_RATIO_RPE, FADEOUT_TIME, ABOVE_SIGN, NOTE_WIDTH_RATIO_BASE, NOTE_W_RPE, kRpePerBeat, lineEvents, buildLines, buildFloor, floorAt,
+ packNoiseAreas, packLowerBound, areaSpans, rpeFromOfficial, HEIGHT_RATIO, SPEED_RATIO_RPE, FADEOUT_TIME, ABOVE_SIGN, NOTE_WIDTH_RATIO_BASE, NOTE_W_RPE, kRpePerBeat, lineEvents, buildLines, buildFloor, floorAt,
   kRpeFactor, isMultiBpm, bpmAt, floorTimeBetween,
 };
 /* ============================================================================
@@ -4275,13 +4437,25 @@ function makeArea(tBeat) {
 }
 
 function buildRpeObj() {                       // 供「导出 RPE」「写回目录」「RPE pez」共用
-  if (!S.doc) return null;
+  if (!S.doc && !S.srcDoc) return null;
   const chartEnd = S.bpm.beat(S.total);
-  let obj = S.doc;
+  // ★ 官方来源：S.doc 只是空壳（judgeLineList: []）→ 必须先转成 RPE 骨架
+  //   （判定线 + 音符），否则导出的 RPE 只剩噪域线、音符全丢（用户实测）。
+  let base;
+  if (S.format === 'rpe' && S.doc) {
+    base = S.doc;
+  } else {
+    base = CORE.rpeFromOfficial(S.srcDoc || S.doc, {
+      bpmList: S.bpm.elements.map(e => ({ bpm: e.bpm, beat: e.beat })),
+      chartEndBeat: chartEnd, snapN: S.snapN,
+      meta: (S.doc && S.doc.META) || null, duration: S.total,
+    });
+  }
+  let obj = base;
   // ★ 可选：把当前噪域【反向写成 Line2Area 判定线】并替换谱里旧的噪域线
   //   （S.rpeNoiseLines = 「RPE 含噪域线」开关）。写的是新对象，不改内存里的 S.doc。
   if (S.rpeNoiseLines) {
-    obj = CORE.rpeWithNoiseLines(S.doc, S.lines, S.areas, { chartEnd: chartEnd, aspect: S.aspect });
+    obj = CORE.rpeWithNoiseLines(base, S.lines, S.areas, { chartEnd: chartEnd, aspect: S.aspect });
   }
   obj = Object.assign({}, obj);
   // ★ 官方形状：RPE Recorder 读的就是它（已过官谱 14355 条往返恒等判据）
@@ -4303,6 +4477,7 @@ function exportRpe() {
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
   status(`已导出 ${S.areas.length} 个噪域`
+    + (S.format !== 'rpe' ? '（官方谱已转 RPE：判定线 + 音符）' : '')
     + (S.rpeNoiseLines ? ` → ${rpeNoiseLineCount(obj)} 条 Line2Area 判定线（时间不重叠的已合并）` : ''), 4000);
 }
 
