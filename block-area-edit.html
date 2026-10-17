@@ -266,6 +266,17 @@
       · 预览画面里拖拽 = 改当前值位置/边长，再点右侧 <b>⟲ 同步</b> 写入事件</p>
     <div class="btns"><button onclick="document.getElementById('dlgHelp').close()">关闭</button></div>
   </div>
+<dialog id="dlgVariant">
+  <h2>官方格式不支持这些「变格功能」</h2>
+  <div class="dbody">
+    <div>当前谱面包含以下官方谱面格式**无法表达、也无法通过拟合解决**的功能：</div>
+    <ul id="variantList" style="margin:8px 0 10px;padding-left:20px;line-height:1.9"></ul>
+    <div>继续导出会<strong>去掉上述功能</strong>后再生成官方谱面（原编辑器内的数据不受影响，随时可再改回 RPE 导出）。</div>
+    <div class="btns" style="justify-content:flex-end;margin-top:12px">
+      <button id="btnVariantCancel">取消</button>
+      <button id="btnVariantOk" class="pri">去掉后导出</button>
+    </div>
+  </div>
 </dialog>
 
 
@@ -2372,77 +2383,118 @@ function encScale(v) {
   return m <= 20 ? m : av;
 }
 
-/** visible/active 布尔轨 → 速度道生命周期事件（1 出现 / 2 激活 / 3 失活 / 4 消失）。
- *  ★ 只有 **visible** 决定"出现/消失"；active 只决定"激活/失活"（且只在可见时生效）。
- *    原因：官方 blockArea 的 enable 区间是"生效"而不是"出现"，可以比 appear 早/晚；
- *    旧实现把 active∪visible 当出现 → 会出现"第一次出现就被写成 4(消失)"（用户实测）。
- *  ★ 时间统一量化到 1/480 拍网格：三元组分母恒为 480（0 拍写 [0,0,1]）。
- *    这样不会出现 0.1249 被 bestTriple 表示成 230400 分母的"插值片"，
- *    也不会让 1/2 两个事件因分母不同被读取器排序错（RPE Recorder 对时间/事件顺序敏感）。
- *  ★ 出现时先写 1（出现）再写 2（激活）：1 放在出现前 1/480 拍（一个 tick），
- *    若前一个事件太近放不下就退化为只写 2（真实谱也常省略 1）。
- *  多周期逐段写；首个事件晚于 0 拍时补 10（初始化）。 */
-function lifeToSpeedEvents(T, chartEnd) {
-  const QD = 480;                                  // 生命周期时间统一网格（1/480 拍）
-  const tick = 1 / QD;
+/** 生命周期状态变化（visible/active 两轨合成）→ {initial, pts}。
+ *  pts 是状态**发生变化**的时刻（t 已量化到 1/480 拍网格），按时间升序。
+ *  ★ 只有 visible 决定出现/消失；active 只在可见时决定激活/失活（不可见时的 active 变化不生成状态变化）。
+ *  ★ 先用【原始时间】求值再量化：0.1250000057 / 6.0000001425 这类浮点起点不会因提前量化被判成"未出现"。
+ *  ★ 出现+生效同一刻只产生一个状态变化；消失+失活同一刻也只产生一个。 */
+function lifeTransitions(T) {
+  const QD = 480;
   const qt = (t) => Math.round(Math.max(0, +t || 0) * QD) / QD;
-  const lifeTriple = (t) => { const q = qt(t); return q === 0 ? [0, 0, 1] : beatsToTriple(q, QD); };
-  const addTimes = (out, track) => {
-    // ★ 用【原始时间】求值，只在记录变化时量化：
-    //   1) 不能先量化再求值：0.1250000057 的事件起点被量化到 0.125（早 5e-9）会判"未出现"；
-    //   2) 也不能 toFixed(9)：6.0000001425 会被截成 6.000000142（早 5e-10），
-    //      导致 6→44 这一整段被判为未出现、速度写成 4（噪域#2 实测）。
-    for (const e of (track || [])) for (const t of [e.start, e.end]) if (isFinite(t)) out.push(Math.max(0, +t));
-  };
   const ts = [];
-  addTimes(ts, T.visible); addTimes(ts, T.active);
-  ts.sort((x, y) => x - y);
+  for (const k of ['visible', 'active']) for (const e of (T[k] || []))
+    for (const t of [e.start, e.end]) if (isFinite(t)) ts.push(Math.max(0, +t));
+  ts.sort((a, b) => a - b);
   const times = [];
   for (const t of ts) if (!times.length || t - times[times.length - 1] > 1e-12) times.push(t);
-  if (!times.length) return [];
-  const changes = [];
-  let curV = false, curA = false;
-  for (let i = 0; i < times.length; i++) {
-    const t = times[i];
-    const T0 = qt(t);
+  const initial = { v: evalBool(T.visible, 0, false), a: evalBool(T.active, 0, false) };
+  if (!times.length) return { initial, pts: [] };
+  const pts = [];
+  let curV = initial.v, curA = initial.a;
+  for (const t of times) {
+    if (qt(t) < 1e-9) { curV = evalBool(T.visible, t, false); curA = evalBool(T.active, t, false); continue; }
     const v = evalBool(T.visible, t, false), a = evalBool(T.active, t, false);
-    if (v !== curV) {
-      if (v) {
-        const prevT = changes.length ? changes[changes.length - 1].t : -1;
-        if (T0 > 1e-9 && T0 - tick > prevT + 1e-9) changes.push({ t: T0 - tick, v: 1 });   // 出现
-        if (a) changes.push({ t: T0, v: 2 });                                            // 同刻激活
-        else if (!changes.length || changes[changes.length - 1].v !== 1) changes.push({ t: T0, v: 1 });
-      } else {
-        changes.push({ t: T0, v: 4 });              // 消失
-      }
-    } else if (v && a !== curA) {
-      changes.push({ t: T0, v: a ? 2 : 3 });        // 可见前提下的激活 / 失活
-    }
+    // 不可见时的 active 变化不生成新状态（active 只在可见时才有意义）
+    if (v !== curV || (v && a !== curA)) pts.push({ t: qt(t), v, a });
     curV = v; curA = a;
   }
-  // 同刻只保留最后一个值（t=0 出现+激活合并为 2；t>0 时两者相隔一个 tick）
-  const dedup = [];
-  for (const c of changes) {
-    const last = dedup[dedup.length - 1];
-    if (last && Math.abs(last.t - c.t) < 1e-9) last.v = c.v;
-    else dedup.push({ t: c.t, v: c.v });
-  }
-  if (!dedup.length) return [];
-  if (dedup[0].t > 1e-9) dedup.unshift({ t: 0, v: 10 });      // 0 拍初始化
   const out = [];
-  for (let i = 0; i < dedup.length; i++) {
-    const t0 = dedup[i].t;
-    let t1 = (i + 1 < dedup.length) ? dedup[i + 1].t
-           : (isFinite(chartEnd) && chartEnd > t0 + 1e-9 ? qt(chartEnd) : t0 + tick);
-    if (!(t1 > t0)) t1 = t0 + tick;
+  for (const p of pts) {
+    const last = out[out.length - 1];
+    if (last && Math.abs(last.t - p.t) < 1e-9) { last.v = p.v; last.a = p.a; }
+    else out.push(p);
+  }
+  return { initial, pts: out };
+}
+
+/** 生命周期时间/值 → RPE 事件三元组（0 拍写 [0,0,1]，其余分母恒 480）。 */
+function lifeTriple(t) {
+  const q = Math.round(Math.max(0, +t || 0) * 480) / 480;
+  return q === 0 ? [0, 0, 1] : beatsToTriple(q, 480);
+}
+
+/** 状态变化点 → 短事件：每个"数值保持不变"的时间段只在开始处写一条，时长**最多 1/4 拍**。
+ *  RPE 对速度道只看事件的开始时间/开始值，后面保持同一值；这样导出的 speed/alpha 道
+ *  一个状态段只有一条短事件，在 RPE 编辑器里好读好改（不再是一长串首尾相接的长事件）。 */
+const LIFE_MAX_DUR = 1 / 4;
+function lifeShortEvents(changes) {
+  const out = [];
+  const tick = 1 / 480;
+  for (let i = 0; i < changes.length; i++) {
+    const t0 = changes[i].t;
+    let dur = LIFE_MAX_DUR;
+    if (i + 1 < changes.length) dur = Math.min(LIFE_MAX_DUR, Math.max(tick, changes[i + 1].t - t0));
+    const t1 = t0 + Math.max(tick, dur);
     out.push({
       startTime: lifeTriple(t0), endTime: lifeTriple(t1),
-      start: dedup[i].v, end: dedup[i].v,
+      start: changes[i].val, end: changes[i].val,
       easingType: 1, bezier: 0, bezierPoints: [0, 0, 0, 0],
       easingLeft: 0, easingRight: 1, linkgroup: 0,
     });
   }
   return out;
+}
+
+/** visible/active → 速度道生命周期（1 出现 / 2 激活 / 3 失活 / 4 消失）。
+ *  规则（用户指定）：
+ *    · 出现+生效同一刻 → 只写 2（不写 1 再写 2）
+ *    · 消失+失活同一刻 → 只写 4（不写 3 再写 4）
+ *    · 一段状态数值不变 → 只在段首写一条 ≤1/4 拍的短事件
+ *    · 首个状态晚于 0 拍 → 0 拍补 10（初始化）
+ *  速度事件在 RPE 里按"边界值"解释（只看起点/起点值），短事件足够让 Recorder 还原状态。 */
+function lifeToSpeedEvents(T, chartEnd) {
+  const { initial, pts } = lifeTransitions(T);
+  const changes = [];
+  if (initial.v) changes.push({ t: 0, val: initial.a ? 2 : 1 });
+  else if (pts.length && pts[0].t > 1e-9) changes.push({ t: 0, val: 10 });   // 0 拍初始化
+  let prevV = initial.v, prevA = initial.a;
+  for (const p of pts) {
+    let val = null;
+    if (!p.v) val = 4;                                  // 消失（同刻失活也只写 4）
+    else if (!prevV) val = p.a ? 2 : 1;                 // 出现（同刻生效只写 2）
+    else if (p.a !== prevA) val = p.a ? 2 : 3;          // 可见前提下的激活 / 失活
+    if (val != null) {
+      const last = changes[changes.length - 1];
+      if (last && last.t === p.t) last.val = val;
+      else changes.push({ t: p.t, val });
+    }
+    prevV = p.v; prevA = p.a;
+  }
+  // 去掉和上一条完全同值的重复（状态变了但速度值相同）
+  const dedup = [];
+  for (const c of changes) {
+    const last = dedup[dedup.length - 1];
+    if (last && last.val === c.val) continue;
+    dedup.push(c);
+  }
+  return dedup.length ? lifeShortEvents(dedup) : [];
+}
+
+/** visible/active → 不透明度事件（用户指定映射）：
+ *    不显示（不可见）        → 0
+ *    出现但失活（可见未生效）→ 111
+ *    激活（可见且生效）      → 255
+ *  同样按"一段不变只在段首写 ≤1/4 拍短事件"压缩。 */
+function lifeToAlphaEvents(T) {
+  const { initial, pts } = lifeTransitions(T);
+  if (!initial.v && !pts.length) return [];             // 从未可见 → 不导出这条线
+  const alphaOf = (v, a) => (!v ? 0 : (a ? 255 : 111));
+  const changes = [{ t: 0, val: alphaOf(initial.v, initial.a) }];
+  for (const p of pts) {
+    const val = alphaOf(p.v, p.a);
+    if (val !== changes[changes.length - 1].val) changes.push({ t: p.t, val });
+  }
+  return lifeShortEvents(changes);
 }
 
 /* ===== 线性关键帧压缩（RDP，垂直距离） =====
@@ -2791,6 +2843,7 @@ function makeNoiseLine(p) {
   const sY = fix(p.sY, p.defH == null ? encScale(RPE_HEIGHT) : p.defH);
   const rot = fix(p.rot, 0);
   const speedEvs = sanitizeRpeEvents(p.speed || []);
+  const alphaEvs = sanitizeRpeEvents(p.alpha || []);
   const anchor = p.anchor || [0.5, 0.5];
   const longEnd = [9999999, 0, 1];
   return {
@@ -2801,7 +2854,7 @@ function makeNoiseLine(p) {
     anchor: [anchor[0], anchor[1]],
     bpmfactor: 1,
     eventLayers: [{
-      alphaEvents: [{ startTime: beatTriple(0), endTime: longEnd, start: 255, end: 255,
+      alphaEvents: alphaEvs.length ? alphaEvs : [{ startTime: beatTriple(0), endTime: longEnd, start: 255, end: 255,
                       easingType: 1, bezier: 0, bezierPoints: [0, 0, 0, 0], easingLeft: 0, easingRight: 1, linkgroup: 0 }],
       moveXEvents: mX, moveYEvents: mY, rotateEvents: rot, speedEvents: speedEvs,
     }],
@@ -2826,6 +2879,7 @@ function areaToRecorderLine(a, opts) {
   const T = a.tracks || a;
   const speed = lifeToSpeedEvents(T, o.chartEnd);
   if (!speed.length) return null;                     // 从未出现 → 没有可导出的生命周期
+  const alpha = lifeToAlphaEvents(T);
   const colorWindows = areaSpans(a, o.chartEnd);
   const colorEvents = buildLineColorEvents([{ area: a, windows: colorWindows }], o.chartEnd);
   let father = (o.father == null ? -1 : o.father);
@@ -2850,7 +2904,7 @@ function areaToRecorderLine(a, opts) {
     father = -1;                                      // 烘焙的是世界坐标 ⇒ 不再挂父线
   }
   return makeNoiseLine({
-    mX, mY, sX, sY, rot, speed, anchor, father,
+    mX, mY, sX, sY, rot, speed, alpha, anchor, father,
     subtract: a.subtract, index: o.index, chartEnd: o.chartEnd,
     defX: a.bx || 0, defY: a.by || 0,
     colorEvents, zOrder: o.zOrder,
@@ -3277,14 +3331,16 @@ function buildMergedLine(group, ctx) {
     act.push(...((a.tracks && a.tracks.active) || []));
   }
   const sortB = (arr) => arr.sort((p, q) => p.start - q.start || (p.a ? 1 : 0) - (q.a ? 1 : 0) || p.end - q.end);
-  const speed = lifeToSpeedEvents({ visible: sortB(vis), active: sortB(act) }, chartEnd);
+  const LT = { visible: sortB(vis), active: sortB(act) };
+  const speed = lifeToSpeedEvents(LT, chartEnd);
   if (!speed.length) return null;
+  const alpha = lifeToAlphaEvents(LT);
   const anchor = A;
   const a0 = areas[0];
   // ★ 彩色噪域：组内各噪域颜色不同 → 按窗口顺序生成颜色事件（默认色由 Recorder 兜底）
   const colorEvents = buildLineColorEvents(areas.map((a, i) => ({ area: a, windows: wins[i] })), chartEnd);
   return makeNoiseLine({
-    mX, mY, sX, sY, rot, speed,
+    mX, mY, sX, sY, rot, speed, alpha,
     anchor: [anchor.x, anchor.y], father,
     subtract: a0.subtract, index: ctx.index, chartEnd,
     defX: a0.bx || 0, defY: a0.by || 0,
@@ -4497,7 +4553,7 @@ NOISE_DEFAULT_COLOR, isColorVal, colorFromAny, colorCopy, colorEq, colorHex, col
   lineStateAt,
   pezInfoTxt,
   recorderSubtractOf, recorderLifeCycle, recorderLineToArea, areaToRecorderLine, rpeWithNoiseLines,
- packNoiseAreas, packLowerBound, areaSpans, rpeFromOfficial, lifeToSpeedEvents, HEIGHT_RATIO, SPEED_RATIO_RPE, FADEOUT_TIME, ABOVE_SIGN, NOTE_WIDTH_RATIO_BASE, NOTE_W_RPE, kRpePerBeat, lineEvents, buildLines, buildFloor, floorAt,
+ packNoiseAreas, packLowerBound, areaSpans, rpeFromOfficial, lifeToSpeedEvents, lifeToAlphaEvents, lifeTransitions, HEIGHT_RATIO, SPEED_RATIO_RPE, FADEOUT_TIME, ABOVE_SIGN, NOTE_WIDTH_RATIO_BASE, NOTE_W_RPE, kRpePerBeat, lineEvents, buildLines, buildFloor, floorAt,
   kRpeFactor, isMultiBpm, bpmAt, floorTimeBetween,
 };
 /* ============================================================================
@@ -8150,10 +8206,12 @@ async function writeToRpeDir() {
 
 /* ---------- 仅导出噪域数据：官方格式 blockAreaList.json ----------
    只把 S.areas 转成【官方格式】的 blockAreaList，单独存成 blockAreaList.json。 */
-function exportAreaList() {
+async function exportAreaList() {
   if (!S.areas.length) return status('还没有噪域可导出', 3000);
+  const v = await variantAreasForOfficial();
+  if (!v) return;
   // ★ 用官方格式序列化器（字段键名/单位完全对照官方谱真值）
-  const list = CORE.toOfficial(S.areas, S.bpm, S.aspect, S.bpm.beat(S.total));
+  const list = CORE.toOfficial(v.areas, S.bpm, S.aspect, S.bpm.beat(S.total));
   if (!list || !list.length) return status('生成 blockAreaList 失败', 3500);
   // ★★ 标准官谱外壳（与官谱同结构，只是没有判定线）：
   //    RPE Recorder 按【谱面对象】解析 —— 以前输出裸数组，它认不出。
@@ -8170,7 +8228,7 @@ function exportAreaList() {
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
   status('已导出【标准官谱格式（无判定线）】：formatVersion ' + doc.formatVersion + ' / offset ' + doc.offset
     + ' / judgeLineList [] / blockAreaList ' + list.length + ' 个噪域'
-    + (CORE.areasHaveColor(S.areas) ? '；⚠ 标准官谱格式没有颜色字段：彩色噪域颜色已丢弃（要保留请用「导出 RPE + RPE 含噪域线」）' : ''), 7000);
+    + (v.features.length ? '；已去掉：' + v.features.map(f => f.label).join('、') : ''), 9000);
 }
 
 /* ---------- 导出 RPE 格式 pez（无噪域判定线）----------
@@ -8304,8 +8362,10 @@ function mergeTwoKf(kx, ky) {
   return ts.map(t => ({ t, x: at(kx, t), y: at(ky, t) }));
 }
 
-/** 当前谱面 → 官方格式对象（formatVersion 3） */
-function buildOfficialObj() {
+/** 当前谱面 → 官方格式对象（formatVersion 3）。
+ *  @param opts { areas }  可选：用去掉了「变格功能」的噪域副本导出（默认 S.areas） */
+function buildOfficialObj(opts) {
+  const srcAreas = (opts && opts.areas) ? opts.areas : S.areas;
   const doc = S.srcDoc || S.doc;
   if (!doc) return null;
   const bpmList = S.bpm.elements.map(e => ({ bpm: e.bpm, startTime: CORE.bestTriple(e.beat, S.snapN) }));
@@ -8518,8 +8578,54 @@ function buildOfficialObj() {
   }
 
   // ---- 噪域 → 官方 blockAreaList（百分比 + 秒 + 关键帧） ----
-  out.blockAreaList = CORE.toOfficial(S.areas, S.bpm, S.aspect, S.bpm.beat(S.total));   // ★ 与「仅导出噪域数据」同一套（已过官谱 14355 条往返恒等判据）
+  out.blockAreaList = CORE.toOfficial(srcAreas, S.bpm, S.aspect, S.bpm.beat(S.total));   // ★ 与「仅导出噪域数据」同一套（已过官谱 14355 条往返恒等判据）
   return out;
+}
+
+/* ---------------- 官方格式「变格功能」检测 / 确认 / 剥离 ----------------
+   官方谱面格式无法表达、也无法通过拟合解决的功能（如彩色噪域颜色事件、噪域载体线音符）。
+   导出官方前必须弹窗告知；用户坚持导出时先去掉这些功能再生成官谱。 */
+function officialVariantFeatures() {
+  const list = [];
+  if (CORE.areasHaveColor(S.areas))
+    list.push({ id: 'color', label: '彩色噪域的颜色事件（官方 blockAreaList 没有颜色通道）' });
+  const carriers = (S.lines || []).filter(L => L && L.noise && Array.isArray(L.notes) && L.notes.length);
+  if (carriers.length) {
+    const n = carriers.reduce((s, L) => s + L.notes.length, 0);
+    list.push({ id: 'carrierNotes', label: n + ' 个噪域载体线音符（官方格式无法表达；噪域线上的音符本就非渲染音符）' });
+  }
+  return list;
+}
+/** 生成"去掉变格功能"后的噪域副本：颜色轨清空（官方格式颜色恒为默认红）。 */
+function stripVariantAreas(areas) {
+  return (areas || []).map(a => {
+    const cp = Object.assign({}, a);
+    cp.tracks = Object.assign({}, (a && a.tracks) || {});
+    cp.tracks.color = [];
+    return cp;
+  });
+}
+/** 变格功能确认框：返回 Promise<boolean>（true=去掉后继续导出，false=取消）。 */
+function confirmOfficialVariants(features) {
+  return new Promise((resolve) => {
+    const dlg = $('dlgVariant'), listEl = $('variantList');
+    if (!dlg || !listEl) return resolve(true);           // 无对话框时退回直接导出
+    listEl.innerHTML = (features || []).map(f => '<li>' + f.label + '</li>').join('');
+    let done = false;
+    const finish = (v) => { if (done) return; done = true; try { dlg.close(); } catch (e) { } resolve(v); };
+    $('btnVariantOk').onclick = () => finish(true);
+    $('btnVariantCancel').onclick = () => finish(false);
+    dlg.oncancel = (e) => { e.preventDefault(); finish(false); };
+    try { dlg.showModal(); } catch (e) { finish(true); }
+  });
+}
+/** 导出官方前统一走一遍：有变格功能 → 弹窗确认 → 返回用于导出的 areas 与提示文本。 */
+async function variantAreasForOfficial() {
+  const feats = officialVariantFeatures();
+  if (!feats.length) return { areas: S.areas, features: feats };
+  const ok = await confirmOfficialVariants(feats);
+  if (!ok) { status('已取消导出：请先处理变格功能，或改用「导出 RPE pez（含噪域线）」保留全部功能', 7000); return null; }
+  return { areas: stripVariantAreas(S.areas), features: feats };
 }
 
 /* ---------- 极简 ZIP 写入器（stored，不压缩）—— .pez 就是普通 zip ---------- */
@@ -8587,12 +8693,14 @@ function download(blob, name) {
 }
 
 /** 导出官方格式 json */
-function exportOfficial() {
-  const o = buildOfficialObj();
+async function exportOfficial() {
+  const v = await variantAreasForOfficial();
+  if (!v) return;
+  const o = buildOfficialObj({ areas: v.areas });
   if (!o) return status('尚未载入谱面', 2500);
   download(new Blob([JSON.stringify(o)], { type: 'application/json' }), (S.docName || 'chart') + '.official.json');
   status('已导出官方格式：' + o.judgeLineList.length + ' 条判定线 / ' + o.blockAreaList.length + ' 个噪域'
-    + (CORE.areasHaveColor(S.areas) ? '；⚠ 官方格式不支持彩色噪域：颜色已丢弃（要保留颜色请用「导出 RPE」并勾选「RPE 含噪域线」）' : ''), 7000);
+    + (v.features.length ? '；已去掉变格功能：' + v.features.map(f => f.label).join('、') : ''), 9000);
 }
 
 /** 导出 .pez（zip：谱面 json + 音乐 + 插图 + info.txt） */
@@ -8609,7 +8717,9 @@ function pickFile(accept, label) {
 }
 
 async function exportPez() {
-  const o = buildOfficialObj();
+  const v = await variantAreasForOfficial();
+  if (!v) return;
+  const o = buildOfficialObj({ areas: v.areas });
   if (!o) return status('尚未载入谱面', 2500);
   // ★ Path 会成为 Phira 的目录名：必须只留安全字符（Windows 非法字符/路径分隔符会导致
   //   创建目录失败 → os error 5 拒绝访问）
@@ -8656,7 +8766,7 @@ async function exportPez() {
   })) });
   download(await zipBuild(files), (m.name || id) + '.pez');
   status('已导出 .pez：' + files.length + ' 个文件（谱面 + 音乐 + 插图 + info.txt）'
-    + (CORE.areasHaveColor(S.areas) ? '；⚠ 官方 pez 无法表达彩色噪域：颜色已丢弃（要保留请用「导出 RPE」并勾选「RPE 含噪域线」）' : ''), 7000);
+    + (v.features.length ? '；已去掉变格功能：' + v.features.map(f => f.label).join('、') : ''), 9000);
 }
 
 document.getElementById('cpAll').onclick = () => { S.areas.forEach((a2, i) => { if (i !== S.sel) cpSel.add(i); }); cpRender(); };
