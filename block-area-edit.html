@@ -666,6 +666,68 @@ function evalBool(events, t, def) {
   return !!events[i].a;
 }
 
+/* ---------- 彩色噪域（Line2Area 的颜色事件） ----------
+   格式：extended.colorEvents[]，start/end 是 [r,g,b]（0~255），时间/缓动字段与普通事件一致。
+   默认色：没有颜色事件时 = [255,84,84]（标准噪域红）。
+   推荐贴图：白色 isSubtract0/1.png（染色更直观；不强制）。 */
+const NOISE_DEFAULT_COLOR = [255, 84, 84];
+function isColorVal(v) {
+  return Array.isArray(v) && v.length >= 3 && isFinite(v[0]) && isFinite(v[1]) && isFinite(v[2]);
+}
+function colorFromAny(v, def) {
+  const d = def || NOISE_DEFAULT_COLOR;
+  if (!isColorVal(v)) return d.slice();
+  return [clamp(Math.round(+v[0]), 0, 255), clamp(Math.round(+v[1]), 0, 255), clamp(Math.round(+v[2]), 0, 255)];
+}
+function colorCopy(c) { return isColorVal(c) ? [+c[0], +c[1], +c[2]] : NOISE_DEFAULT_COLOR.slice(); }
+function colorEq(a, b) {
+  const x = colorFromAny(a, NOISE_DEFAULT_COLOR), y = colorFromAny(b, NOISE_DEFAULT_COLOR);
+  return x[0] === y[0] && x[1] === y[1] && x[2] === y[2];
+}
+function colorHex(c) {
+  const v = colorFromAny(c, NOISE_DEFAULT_COLOR);
+  return '#' + v.map(n => ('0' + n.toString(16)).slice(-2)).join('');
+}
+/** '#rrggbb' → [r,g,b]；不合法返回 null。 */
+function colorFromHex(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || '').trim());
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+function colorCss(c, alpha) {
+  const v = colorFromAny(c, NOISE_DEFAULT_COLOR);
+  return 'rgba(' + v[0] + ',' + v[1] + ',' + v[2] + ',' + (alpha == null ? 1 : alpha) + ')';
+}
+/** 这些噪域里是否有非默认色（用于「官方格式不支持彩色噪域」的提示） */
+function areasHaveColor(areas) {
+  for (const a of (areas || [])) {
+    for (const e of (((a && a.tracks && a.tracks.color) || []))) {
+      if (!colorEq(e.a, NOISE_DEFAULT_COLOR) || !colorEq(e.b, NOISE_DEFAULT_COLOR)) return true;
+    }
+  }
+  return false;
+}
+/** 颜色轨求值：RGB 各自按与数值轨相同的缓动插值（ezL/ezR/bezier 都生效）。 */
+function evalColor(events, t, def) {
+  const d = def || NOISE_DEFAULT_COLOR;
+  if (!events || !events.length) return d.slice();
+  const i = lastStartLE(events, t);
+  if (i < 0) return d.slice();
+  const e = events[i];
+  const a = colorFromAny(e.a, d), b = colorFromAny(e.b, d);
+  if (t >= e.end) return b;
+  const span = e.end - e.start;
+  let p = span <= 0 ? 1 : (t - e.start) / span;
+  p = Math.min(1, Math.max(0, p));
+  const eL = (e.ezL == null) ? 0 : e.ezL, eR = (e.ezR == null) ? 1 : e.ezR;
+  const q = (eR > eL) ? (eL + p * (eR - eL)) : p;
+  const f = (e.bez && e.bez.length === 4) ? bezierEase(e.bez[0], e.bez[1], e.bez[2], e.bez[3], q)
+                                          : rpeEase(e.easing || 1, q);
+  return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f]
+    .map(v => clamp(Math.round(v), 0, 255));
+}
+
 /* ---------- 轨定义 ---------- */
 
 const TRACKS = [
@@ -674,6 +736,8 @@ const TRACKS = [
   { key: 'width', label: '宽', short: '宽', color: '#3ddc97', def: RPE_WIDTH, bool: false },
   { key: 'height', label: '高', short: '高', color: '#9ae66e', def: RPE_HEIGHT, bool: false },
   { key: 'rotation', label: '旋转', short: '旋', color: '#c07dff', def: 0, bool: false },
+  // ★ 彩色噪域：颜色是独立事件类型（Line2Area 的 extended.colorEvents）
+  { key: 'color', label: '颜色', short: '色', color: '#ff7a9e', def: NOISE_DEFAULT_COLOR, bool: false, colorTrack: true },
   { key: 'visible', label: '出现', short: '现', color: '#ffd15c', def: false, bool: true },
   { key: 'active', label: '生效', short: '效', color: '#ff8a5c', def: false, bool: true },
 ];
@@ -822,7 +886,7 @@ function anchorModeOf(a) { return (a && a.anchorMode) || (a && a.recNoise ? 'rec
      · `bx/by`、`lockAnchor` 丢 → 基准中心/简单模式复位
      实测（scarlet 26 个噪域）：**17 个几何被改，最大偏 1423 RPE（超过一屏）**。
    ★ `parentLine` 是对象引用、不能直接 JSON 化 → 记它在 lines 里的下标，恢复时再挂回去。 */
-const AREA_EXTRA_FIELDS = ['recNoise', 'recTimes', 'recBox', 'recSig', 'recLifeSig', 'recBoxSig'];
+const AREA_EXTRA_FIELDS = ['recNoise', 'recTimes', 'recBox', 'recSig', 'recLifeSig', 'recBoxSig', 'zOrder'];
 /** ★★ 轨道序列化必须显式带上 `.layers`：
  *  `JSON.stringify` 对【数组】只序列化元素、**丢弃自定义属性** —— 而"事件层"正是挂在轨数组上的
  *  `arr.layers`。丢掉它，撤销后两层求和就退回"线性化合并"，实测几何最大偏 **394 RPE**。 */
@@ -1573,11 +1637,14 @@ function areaState(area, tBeat, aspect, nowView) {
     width: evalNum(tracks.width, tBeat, RPE_WIDTH),
     height: evalNum(tracks.height, tBeat, RPE_HEIGHT),
     rotation: evalNum(tracks.rotation, tBeat, 0),
+    // 彩色噪域：没有颜色事件 → 默认红 [255,84,84]
+    color: evalColor(tracks.color, tBeat, NOISE_DEFAULT_COLOR),
     disp: d,
   };
   if (nowView) for (const k of ['centerX', 'centerY', 'width', 'height', 'rotation']) {
     if (nowView[k] != null) st[k] = nowView[k];
   }
+  if (nowView && nowView.color != null) st.color = colorCopy(nowView.color);
   // ★ 父线复合（与判定线同一套）：子噪域的事件值也是相对父线的
   //   世界位置 = 父线坐标 + R(父线角度)·自身坐标；世界角度 = 自身角度 + 父线角度
   if (area.parentLine) {
@@ -1597,7 +1664,8 @@ function areaState(area, tBeat, aspect, nowView) {
 function trackValueAt(tracks, key, tBeat, nowView) {
   const t = TRACK_BY_KEY[key];
   if (t.bool) return evalBool(tracks[key], tBeat, t.def);
-  if (nowView && nowView[key] != null) return nowView[key];
+  if (nowView && nowView[key] != null) return t.colorTrack ? colorCopy(nowView[key]) : nowView[key];
+  if (t.colorTrack) return evalColor(tracks[key], tBeat, t.def);
   return evalNum(tracks[key], tBeat, t.def);
 }
 
@@ -1799,6 +1867,11 @@ function toJson(areas, den) {
       const evs = a.tracks[t.key] || [];
       out[t.key] = evs.map(e => {
         if (t.bool) return { startTime: T(e.start), endTime: T(e.end), value: !!e.a };
+        if (t.colorTrack) return {
+          startTime: T(e.start), endTime: T(e.end),
+          start: colorFromAny(e.a).slice(), end: colorFromAny(e.b).slice(),
+          easingType: e.easing || 1,
+        };
         const o = { startTime: T(e.start), endTime: T(e.end), start: e.a, end: e.b, easingType: e.easing || 1 };
         if (e.ax != null) {
           if (isRect) {
@@ -1826,6 +1899,10 @@ function parseAreas(raw, bpm) {
       for (const t of TRACKS) {
         tracks[t.key] = (a[t.key] || []).map(e => {
           if (t.bool) return { start: tripleToBeats(e.startTime), end: tripleToBeats(e.endTime), a: !!e.value, b: !!e.value, easing: 1 };
+          if (t.colorTrack) return {
+            start: tripleToBeats(e.startTime), end: tripleToBeats(e.endTime),
+            a: colorFromAny(e.start), b: colorFromAny(e.end), easing: e.easingType || 1,
+          };
           const o = { start: tripleToBeats(e.startTime), end: tripleToBeats(e.endTime), a: +e.start || 0, b: +e.end || 0, easing: e.easingType || 1 };
           if (e.anchorX != null) { o.ax = e.anchorX; o.ay = e.anchorY == null ? 0 : e.anchorY; }
           return o;
@@ -1835,6 +1912,7 @@ function parseAreas(raw, bpm) {
       const isRect = !!a.anchorFollowsRect;
       const na = newArea(tracks, !!a.isSubtract, a.baseX || 0, a.baseY || 0, !!a.anchorFollowsCenter,
         isRect ? 'rect' : 'abs');
+      if (a.zOrder != null) na.zOrder = +a.zOrder || 0;
       // ★ rect 区的 anchorX/anchorY 按规范是【归一化支点 [0,1]】；内部存的是基准尺寸位移 → 换算回来
       if (isRect) {
         const b = baseSizeOf(na);
@@ -2054,6 +2132,27 @@ function lineEvents(list, factor) {
   return sortTrack(evs);
 }
 
+/** RPE extended.colorEvents -> 内部颜色事件（a/b 是 [r,g,b] 数组）。
+ *  彩色噪域 = Line2Area 上的颜色事件；早期/普通线可能没有该字段 → 返回空（默认红）。 */
+function colorEventsOf(list) {
+  if (!list || !list.length) return [];
+  const evs = [];
+  for (const e of list) {
+    if (!e || !isColorVal(e.start) || !isColorVal(e.end)) continue;
+    const s = tripleToBeats(e.startTime), en = tripleToBeats(e.endTime);
+    if (!(en > s + 1e-12)) continue;
+    evs.push({
+      start: s, end: en,
+      a: colorFromAny(e.start), b: colorFromAny(e.end),
+      easing: e.easingType || 1,
+      ezL: (e.easingLeft == null ? 0 : e.easingLeft),
+      ezR: (e.easingRight == null ? 1 : e.easingRight),
+      bez: (e.bezier && Array.isArray(e.bezierPoints) && e.bezierPoints.length === 4) ? e.bezierPoints : null,
+    });
+  }
+  return sortTrack(evs);
+}
+
 /** 官方 T 单位 -> 拍（1 拍 = 32 T） */
 const T2B = 1 / 32;
 
@@ -2197,6 +2296,11 @@ function recorderLineToArea(L, allLines) {
   if (hEv.length) tracks.height = hEv;
   tracks.centerX = xEv; tracks.centerY = yEv;
   tracks.rotation = (L.ev.rot && L.ev.rot.length) ? L.ev.rot : [];
+  // ★ 彩色噪域：颜色事件（Line2Area 的 extended.colorEvents）；没有 = 默认红
+  tracks.color = (L.color && L.color.length) ? L.color.map(e => Object.assign({}, e, {
+    a: colorCopy(e.a), b: colorCopy(e.b),
+  })) : [];
+  if (tracks.color.length) sortTrack(tracks.color);
   // ★ anchor = 锚点（旋转/缩放支点）在贴图上的归一化位置，说明书：
   //     x: 0.5=中心，1 时判定线向左移，0 时向右移
   //     y: 0.5=中心，1 时判定线向下移，0 时向上移
@@ -2220,6 +2324,7 @@ function recorderLineToArea(L, allLines) {
   //   却仍然停在上边缘中心。RPE 里噪域线的坐标就是随角度变的。
   const a2 = newArea(tracks, !!L.subtract, xEv[0].a, yEv[0].a, false, 'rect');
   a2.recNoise = true;                        // ★ 来源标记（暂存同步用）；语义一律看 anchorMode
+  a2.zOrder = (L.zOrder | 0) || 0;           // ★ 彩色噪域遮挡顺序（RPE 的 zOrder）
   // ★ 必须显式写 'rect'：新区的默认是 'abs'，而锚点分派只看 anchorMode ——
   //   漏了这一步，Recorder 噪域的 ax/ay（基准尺寸位移）会被当成绝对点，几何整块错。
   // ★ 来源签名：暂存目录同步时用它判断"这条判定线噪域是否已经存过"（精确匹配，不靠模糊几何）
@@ -2565,6 +2670,105 @@ function bakeLineTracks(a, aspect, chartEnd) {
   };
 }
 
+/** RPE 颜色事件（start/end 为 [r,g,b]）。彩色噪域 = Line2Area 的 extended.colorEvents。 */
+function mkColorRpeEv(t0, t1, c0, c1, ez) {
+  return {
+    startTime: beatTriple(t0), endTime: beatTriple(t1),
+    start: colorCopy(c0), end: colorCopy(c1),
+    easingType: (ez >= 1 && ez <= 29) ? ez : 1,
+    bezier: 0, bezierPoints: [0, 0, 0, 0],
+    easingLeft: 0, easingRight: 1, linkgroup: 0,
+  };
+}
+
+/** 一组 {area, windows} → 合并线的 extended.colorEvents。
+ *  · 颜色按窗口内的事件求值（支持缓动）；窗口开始/内部跳变用 1/480 拍 tick 表达；
+ *  · Recorder 的默认色是 [255,84,84]：**只写非默认色段**，非默认结束后补回默认色；
+ *  · 全默认 → 返回 []（JSON 里不写 colorEvents，行为=默认红）。
+ *  注意：不同颜色的重叠遮挡由 RPE 的 zOrder / 线号决定（见 rpeWithNoiseLines 的 zOrder 分配），
+ *  颜色事件本身只负责"这条线在它出现的时段是什么颜色"。 */
+function buildLineColorEvents(items, chartEnd) {
+  const TICK = 1 / 480;
+  const DEF = NOISE_DEFAULT_COLOR;
+  const qt = (t) => Math.round(Math.max(0, +t || 0) * 480) / 480;
+  const list = (items || []).filter(it => it && it.area && it.windows && it.windows.length)
+    .slice().sort((p, q) => (p.windows[0][0] - q.windows[0][0]) || (p.windows[0][1] - q.windows[0][1]));
+  if (!list.length) return [];
+  const keys = [];
+  const pushKey = (t, c) => { keys.push({ t: qt(t), c: colorFromAny(c) }); };
+  let anyColor = false;
+  for (const it of list) {
+    const A = it.area, ct = (A.tracks && A.tracks.color) || [];
+    const val = (t) => evalColor(ct, t, DEF);
+    for (const [w0, w1] of it.windows) {
+      pushKey(w0, val(w0));
+      for (const e of ct) {
+        if (!(e.end > w0 + 1e-9) || !(e.start < w1 - 1e-9)) continue;
+        const s = Math.max(e.start, w0), en = Math.min(e.end, w1);
+        if (!(en > s + 1e-9)) continue;
+        pushKey(s - TICK, val(s - 1e-9));       // 跳变前（保持左极限）
+        pushKey(s, val(s));                     // 事件右极限
+        // 非线性缓动：在窗口内细分采样，避免线性化把颜色曲线拉直
+        if ((e.easing && e.easing !== 1) || (e.bez && e.bez.length === 4)) {
+          for (let k = 1; k < 8; k++) {
+            const u = s + (en - s) * k / 8;
+            pushKey(u, val(u));
+          }
+        }
+        pushKey(en, val(en));
+        pushKey(en + TICK, val(en + 1e-9));
+        if (!colorEq(e.a, DEF) || !colorEq(e.b, DEF)) anyColor = true;
+      }
+      pushKey(w1, val(w1));
+      if (!colorEq(val(w0), DEF) || !colorEq(val(w1), DEF)) anyColor = true;
+    }
+    // 检查窗口内部（含中点）是否非默认
+    for (const [w0, w1] of it.windows) {
+      for (const u of [0.25, 0.5, 0.75]) if (!colorEq(val(w0 + (w1 - w0) * u), DEF)) anyColor = true;
+    }
+  }
+  if (!anyColor || !keys.length) return [];
+  keys.sort((p, q) => p.t - q.t);
+  const ks = [];
+  for (const k of keys) {
+    const last = ks[ks.length - 1];
+    if (last && Math.abs(last.t - k.t) < 1e-9) last.c = k.c;
+    else ks.push({ t: k.t, c: k.c });
+  }
+  if (ks[0].t > 1e-9) ks.unshift({ t: 0, c: DEF.slice() });
+  const cEnd = (isFinite(chartEnd) && chartEnd > ks[ks.length - 1].t + 1e-9) ? qt(chartEnd) : 0;
+  if (cEnd > ks[ks.length - 1].t + 1e-9) ks.push({ t: cEnd, c: ks[ks.length - 1].c.slice() });
+  // 原始色段
+  const segs = [];
+  for (let i = 0; i + 1 < ks.length; i++) {
+    const t0 = ks[i].t, t1 = ks[i + 1].t;
+    if (!(t1 > t0 + 1e-9)) continue;
+    segs.push({ t0, t1, c0: ks[i].c.slice(), c1: ks[i + 1].c.slice() });
+  }
+  if (!segs.length) return [];
+  const isDef = (s) => colorEq(s, DEF);
+  const first = segs.findIndex(s => !isDef(s.c0) || !isDef(s.c1));
+  if (first < 0) return [];
+  // 最后一段非默认之后，若回到默认要保留"复位段"（让 Recorder 变回默认红），再截断
+  let last = segs.length - 1;
+  while (last > first && isDef(segs[last].c0) && isDef(segs[last].c1)) last--;
+  if (last + 1 < segs.length && (!isDef(segs[last].c1) || isDef(segs[last + 1].c0))) last = Math.min(segs.length - 1, last + 1);
+  const out = [];
+  for (let i = first; i <= last; i++) {
+    const s = segs[i];
+    const prev = out[out.length - 1];
+    // 合并"同色常段"（减少事件数）：仅当两段颜色完全相同且首尾相接
+    if (prev && colorEq(s.c0, s.c1) && colorEq(prev.start, prev.end) &&
+        colorEq(prev.start, s.c0) &&
+        Math.abs(tripleToBeats(prev.endTime) - s.t0) < 1e-9) {
+      prev.endTime = mkColorRpeEv(s.t0, s.t1, s.c0, s.c1).endTime;
+      continue;
+    }
+    out.push(mkColorRpeEv(s.t0, s.t1, s.c0, s.c1));
+  }
+  return out;
+}
+
 /** 组装一条 Line2Area 噪域判定线（单区导出 / 合并导出共用）。
  *  兜底默认值与 areaState 一致：中心=0、宽=RPE_WIDTH、高=RPE_HEIGHT、旋转=0；
  *  最终 sanitize：零长/负长/重叠一律不写。 */
@@ -2597,14 +2801,14 @@ function makeNoiseLine(p) {
                       easingType: 1, bezier: 0, bezierPoints: [0, 0, 0, 0], easingLeft: 0, easingRight: 1, linkgroup: 0 }],
       moveXEvents: mX, moveYEvents: mY, rotateEvents: rot, speedEvents: speedEvs,
     }],
-    extended: { inclineEvents: [], scaleXEvents: sX, scaleYEvents: sY },
+    extended: { colorEvents: (p.colorEvents || []).slice(), inclineEvents: [], scaleXEvents: sX, scaleYEvents: sY },
     father: (p.father == null ? -1 : p.father),
     isCover: 1, isGif: false, numOfNotes: 0,
     posControl: [{ x: 0, pos: 1, easing: 1 }, { x: 9999999, pos: 1, easing: 1 }],
     sizeControl: [{ x: 0, size: 1, easing: 1 }, { x: 9999999, size: 1, easing: 1 }],
     skewControl: [{ x: 0, skew: 0, easing: 1 }, { x: 9999999, skew: 0, easing: 1 }],
     yControl: [{ x: 0, y: 1, easing: 1 }, { x: 9999999, y: 1, easing: 1 }],
-    zOrder: 0,
+    zOrder: (p.zOrder == null ? 0 : (p.zOrder | 0)),
   };
 }
 
@@ -2618,6 +2822,8 @@ function areaToRecorderLine(a, opts) {
   const T = a.tracks || a;
   const speed = lifeToSpeedEvents(T, o.chartEnd);
   if (!speed.length) return null;                     // 从未出现 → 没有可导出的生命周期
+  const colorWindows = areaSpans(a, o.chartEnd);
+  const colorEvents = buildLineColorEvents([{ area: a, windows: colorWindows }], o.chartEnd);
   let father = (o.father == null ? -1 : o.father);
   let mX, mY, sX, sY, rot, anchor = [0.5, 0.5];
   if (canStructLine(a, o.forceBake)) {
@@ -2643,6 +2849,7 @@ function areaToRecorderLine(a, opts) {
     mX, mY, sX, sY, rot, speed, anchor, father,
     subtract: a.subtract, index: o.index, chartEnd: o.chartEnd,
     defX: a.bx || 0, defY: a.by || 0,
+    colorEvents, zOrder: o.zOrder,
   });
 }
 
@@ -3070,11 +3277,14 @@ function buildMergedLine(group, ctx) {
   if (!speed.length) return null;
   const anchor = A;
   const a0 = areas[0];
+  // ★ 彩色噪域：组内各噪域颜色不同 → 按窗口顺序生成颜色事件（默认色由 Recorder 兜底）
+  const colorEvents = buildLineColorEvents(areas.map((a, i) => ({ area: a, windows: wins[i] })), chartEnd);
   return makeNoiseLine({
     mX, mY, sX, sY, rot, speed,
     anchor: [anchor.x, anchor.y], father,
     subtract: a0.subtract, index: ctx.index, chartEnd,
     defX: a0.bx || 0, defY: a0.by || 0,
+    colorEvents, zOrder: ctx.zOrder,
   });
 }
 
@@ -3135,6 +3345,26 @@ function rpeWithNoiseLines(doc, lines, areas, opts) {
   const groups = (o.merge === false)
     ? (areas || []).map(a => [a])
     : packNoiseAreas(areas, chartEnd).map(g => g.areas);
+  // ★ 彩色噪域遮挡：RPE 按「最高 zOrder，其次线号」决定谁在上。
+  //   S.areas 的顺序就是编辑器的叠放顺序（后面的在上）；导入的旧噪域线还带原始 zOrder。
+  //   这里把每条重建线压成排名：以组内最大 zOrder 为主、组内最大噪域下标为次，
+  //   再把名次写回 zOrder —— 这样合并/重排判定线后遮挡关系仍然和编辑器一致。
+  const areaIdx = new Map();
+  for (let i = 0; i < (areas || []).length; i++) areaIdx.set(areas[i], i);
+  const stackKey = (g) => {
+    let z = 0, ix = -1;
+    for (const a of g) {
+      if (!a) continue;
+      z = Math.max(z, (a.zOrder | 0) || 0);
+      ix = Math.max(ix, areaIdx.has(a) ? areaIdx.get(a) : -1);
+    }
+    return [z, ix];
+  };
+  const rankOf = new Map();
+  groups.map((g, i) => i).sort((i, j) => {
+    const A = stackKey(groups[i]), B = stackKey(groups[j]);
+    return (A[0] - B[0]) || (A[1] - B[1]);
+  }).forEach((gi, r) => rankOf.set(gi, r));
   groups.forEach((g, gi) => {
     if (!g.length) return;
     let ln;
@@ -3146,11 +3376,11 @@ function rpeWithNoiseLines(doc, lines, areas, opts) {
         if (oi >= 0 && oldToNew.has(oi)) father = oldToNew.get(oi);
         else forceBake = true;
       }
-      ln = areaToRecorderLine(a, { father, forceBake, index: gi, chartEnd, aspect: o.aspect });
+      ln = areaToRecorderLine(a, { father, forceBake, index: gi, chartEnd, aspect: o.aspect, zOrder: rankOf.get(gi) });
     } else {
-      ln = buildMergedLine(g, Object.assign({ index: gi }, ctx));
+      ln = buildMergedLine(g, Object.assign({ index: gi, zOrder: rankOf.get(gi) }, ctx));
     }
-    if (ln) { attachNotes(ln, g); outLines.push(ln); }
+    if (ln) { ln.zOrder = rankOf.get(gi); attachNotes(ln, g); outLines.push(ln); }
   });
   // 映射不上的旧噪域线音符：挂到第一条重建的噪域线上（保持音符总数）
   if (orphanNotes.length) {
@@ -4065,6 +4295,8 @@ function buildLines(doc, format) {
 
           speed: _chain('speedEvents', 1, 1),
         },
+        // ★ 彩色噪域：颜色事件在 extended.colorEvents（RGB 数组；没有 = 默认红）
+        color: colorEventsOf((L.extended || {}).colorEvents),
         kRpe: kRpePerBeat((doc.BPMList && doc.BPMList[0] && doc.BPMList[0].bpm) || 170, false),
         notes: (L.notes || []).map(n => ({
           t: tripleToBeats(n.startTime), te: tripleToBeats(n.endTime),
@@ -4083,6 +4315,7 @@ function buildLines(doc, format) {
         anchor01: L.anchor,      // 判定线 anchor（0~1 归一化）
 
         father: (L.father == null ? -1 : L.father),   // ★ 父线（子线要继承父线变换）
+        zOrder: (L.zOrder | 0) || 0,                    // ★ 彩色噪域遮挡：zOrder 高者在上
         texture: L.Texture,
       });
     }
@@ -4234,6 +4467,7 @@ const CORE = {
   rpeToPct, pctToRpe, pctToChart, chartToPct, chartToScreen, screenToChart,
   viewRect, chartToScreenV, screenToChartV,
   TWEEN, RPE_EASE_ID, RPE_EASE_NAMES, rpeEase, evalNum, evalBool, lastStartLE,
+NOISE_DEFAULT_COLOR, isColorVal, colorFromAny, colorCopy, colorEq, colorHex, colorCss, colorFromHex, evalColor, colorEventsOf, buildLineColorEvents, areasHaveColor,
   EASE_MAJORS, EASE_MINORS, easeParts, easeFromParts, TWEEN_TO_RPE,
   TRACKS, TRACK_BY_KEY, emptyTracks, newArea, areaState, anchorDisp, currentAnchor, anchorOffset, anchorModeOf, safeDiv, trackValueAt, sortTrack, eventCovering,
   baseSizeOf, storedRectAnchor, rectPivotToAnchor, anchorToRectPivot, setRectAnchor, setScaleAnchorPair, rectPivotPoint, rectPivotOfPoints, localStateOf, localPointOf, toWorld, absPointToRectPivot, convertAnchorMode, rebaseCenter, scaleAnchorOf, chainActivity, rotationCenterOf, trackSig, lifeSig,
@@ -5124,9 +5358,12 @@ function renderStage() {
     if (!(tr.size.x > 1e-9) || !(tr.size.y > 1e-9)) continue;
     quads.push({
       i: it.i, subtract: !!it.area.subtract, active: !!it.st.active,
+      color: it.st.color, zOrder: (it.area.zOrder | 0) || 0,
       cs: CORE.quadCorners(tr).map(c => CORE.chartToScreenV(c, A, v)),
     });
   }
+  // ★ 彩色噪域遮挡：按 zOrder、再按噪域序号从下往上画（后画=在上，颜色压住下面的）
+  quads.sort((p, q) => (p.zOrder - q.zOrder) || (p.i - q.i));
   const drawn = quads.length;
   const nActive = quads.filter(q => q.active).length;
 
@@ -5148,20 +5385,19 @@ function renderStage() {
     sctx.globalAlpha = 0.45; sctx.drawImage(mkAct, 0, 0, w, h);
     sctx.globalAlpha = 1;
   } else {
-    // 编辑视图：普通块 = 红，减算块 = 蓝；未生效 → 低不透明度
+    // 编辑视图：填充色 = 噪域颜色（默认红）；减算块用虚线边框区分。
+    // ★ 画序已按 zOrder/序号排好：重叠处后画的（更高 zOrder / 更大线号）颜色在上，
+    //   与 RPE 的遮挡规则一致（"最高 zOrder 或线号在最上方"）。
     for (const q of quads) {
       sctx.beginPath(); sctx.moveTo(q.cs[0].x, q.cs[0].y);
       for (let k = 1; k < 4; k++) sctx.lineTo(q.cs[k].x, q.cs[k].y);
       sctx.closePath();
-      if (q.subtract) {
-        sctx.fillStyle = q.active ? 'rgba(86,150,255,.30)' : 'rgba(86,150,255,.10)';
-        sctx.strokeStyle = q.active ? 'rgba(125,176,255,.95)' : 'rgba(125,176,255,.45)';
-      } else {
-        sctx.fillStyle = q.active ? 'rgba(255,86,86,.30)' : 'rgba(255,86,86,.10)';
-        sctx.strokeStyle = q.active ? 'rgba(255,120,120,.95)' : 'rgba(255,120,120,.45)';
-      }
+      sctx.fillStyle = CORE.colorCss(q.color, q.active ? 0.34 : 0.12);
+      sctx.strokeStyle = CORE.colorCss(q.color, q.active ? 0.98 : 0.45);
       sctx.lineWidth = q.active ? 1.6 : 1;
+      sctx.setLineDash(q.subtract ? [5, 3] : []);
       sctx.fill(); sctx.stroke();
+      sctx.setLineDash([]);
     }
   }
 
@@ -5252,7 +5488,7 @@ function renderStage() {
 
   let hud = `t=${S.time.toFixed(3)}s  beat=${tBeat.toFixed(3)}  (${CORE.fmtBeat(CORE.beatsToTriple(tBeat, S.snapN))})\n` +
     `可见噪域 ${drawn} / ${S.areas.length}（生效 ${nActive} · 未生效 ${drawn - nActive}）   音符 ${nNotes}\n` +
-    `渲染 ${S.machineTruth ? '实机贴合：红=实机会渲染出噪域的区域（含减算块反转出来的块）' : '编辑视图：红=普通块 蓝=减算块'}   范围 ${Math.round(v.vw)}×${Math.round(v.vh)}`;
+    `渲染 ${S.machineTruth ? '实机贴合：红=实机会渲染出噪域的区域（含减算块反转出来的块）' : '编辑视图：填充=噪域颜色（默认红），虚线=减算块；重叠按 zOrder/序号遮挡'}   范围 ${Math.round(v.vw)}×${Math.round(v.vh)}`;
   if (S.now) hud += `\n● 预览已改动（点 ⟲ 写入事件）`;
       { const nSel = collectSel().length; if (nSel > 1) hud += `\n● 已选 ${nSel} 个事件（Ctrl+点击增删 · ↑↓ 按吸附步长移动 · Delete 删除全部）`; }
   $('hud').textContent = hud;
@@ -5335,7 +5571,9 @@ function copySelEvents() {
   if (!items.length) return 0;
   S.clip = { anchor: t0, items: items.map(({ track, e }) => ({
     track, d0: e.start - t0, d1: e.end - t0,
-    a: e.a, b: e.b, easing: e.easing, ax: e.ax, ay: e.ay })) };
+    a: (CORE.TRACK_BY_KEY[track] && CORE.TRACK_BY_KEY[track].colorTrack) ? CORE.colorCopy(e.a) : e.a,
+    b: (CORE.TRACK_BY_KEY[track] && CORE.TRACK_BY_KEY[track].colorTrack) ? CORE.colorCopy(e.b) : e.b,
+    easing: e.easing, ax: e.ax, ay: e.ay })) };
   return items.length;
 }
 /** 在播放头处粘贴剪贴板里的事件（保留相对偏移与轨道） */
@@ -5348,7 +5586,9 @@ function pasteClipEvents() {
   for (const it of c.items) {
     const arr = a.tracks[it.track]; if (!arr) continue;
     const s = Math.max(0, base + it.d0), e2 = Math.max(0, base + it.d1);
-    const rec = { start: s, end: Math.max(s + 1e-6, e2), a: it.a, b: it.b, easing: it.easing || 1 };
+    const isC = !!(CORE.TRACK_BY_KEY[it.track] && CORE.TRACK_BY_KEY[it.track].colorTrack);
+    const rec = { start: s, end: Math.max(s + 1e-6, e2),
+      a: isC ? CORE.colorCopy(it.a) : it.a, b: isC ? CORE.colorCopy(it.b) : it.b, easing: it.easing || 1 };
     if (it.ax != null) { rec.ax = it.ax; rec.ay = it.ay == null ? 0 : it.ay; }
     arr.push(rec);
     CORE.sortTrack(arr);
@@ -5387,7 +5627,9 @@ function cloneSelToAreas(targets, offsetBeats) {
       const arr = dst.tracks[it.track];
       if (!arr) continue;
       const s = Math.max(0, it.e.start + off), en = Math.max(0, it.e.end + off);
-      const rec = { start: s, end: Math.max(s + 1e-6, en), a: it.e.a, b: it.e.b, easing: it.e.easing || 1 };
+      const isC = !!(CORE.TRACK_BY_KEY[it.track] && CORE.TRACK_BY_KEY[it.track].colorTrack);
+      const rec = { start: s, end: Math.max(s + 1e-6, en),
+        a: isC ? CORE.colorCopy(it.e.a) : it.e.a, b: isC ? CORE.colorCopy(it.e.b) : it.e.b, easing: it.e.easing || 1 };
       if (it.e.ax != null) { rec.ax = it.e.ax; rec.ay = it.e.ay == null ? 0 : it.e.ay; }
       arr.push(rec);
       CORE.sortTrack(arr);
@@ -5485,7 +5727,8 @@ function renderTimeline() {
           tctx.fillStyle = t.color; tctx.globalAlpha = 0.20;
           tctx.fillRect(x, top, cw, bot - top); tctx.globalAlpha = 1;
         } else {
-          tctx.strokeStyle = t.color; tctx.globalAlpha = 0.28; tctx.lineWidth = 1;
+          tctx.strokeStyle = t.colorTrack ? CORE.colorCss(evsAll[k].b, 0.55) : t.color;
+          tctx.globalAlpha = 0.28; tctx.lineWidth = 1;
           tctx.beginPath(); tctx.moveTo(x + cw / 2 + .5, top); tctx.lineTo(x + cw / 2 + .5, bot); tctx.stroke();
           tctx.globalAlpha = 1;
         }
@@ -5504,7 +5747,8 @@ function renderTimeline() {
         const shave = isLastEv ? 0 : 1;
         const top2 = top + shave;
         const drawH = Math.max(1, bot - top2);
-        tctx.fillStyle = t.bool ? (e.a ? t.color : '#3a4050') : t.color;
+        tctx.fillStyle = t.bool ? (e.a ? t.color : '#3a4050')
+          : (t.colorTrack ? CORE.colorCss(e.a, 1) : t.color);
         tctx.globalAlpha = selected ? 1 : 0.62;
         tctx.fillRect(x, top2, cw, drawH);
         tctx.globalAlpha = 1;
@@ -5825,7 +6069,11 @@ function renderProps() {
 
   // —— 组 1：噪域本体（类型 + 当前值）——
   html += `<div class="grp"><h4>噪域 #${S.sel} <span class="pill">${st.visible ? '显示' : '隐藏'} · ${st.active ? '生效' : '未生效'}</span></h4><div class="body">
-    <div class="f"><span>类型</span><label class="chk"><input type="checkbox" id="chkSub" ${a.subtract ? 'checked' : ''}> 减算块 (isSubtract)</label></div>`;
+    <div class="f"><span>类型</span><label class="chk"><input type="checkbox" id="chkSub" ${a.subtract ? 'checked' : ''}> 减算块 (isSubtract)</label></div>
+    <div class="f"><span>颜色</span><input type="color" data-cur="color" value="${CORE.colorHex(st.color)}">
+      <span class="mono" style="font-size:11px;color:var(--dim)">${CORE.colorHex(st.color)} · ${CORE.colorEq(st.color, CORE.NOISE_DEFAULT_COLOR) ? '默认红' : '彩色'}（无颜色事件 = 默认 255,84,84）</span></div>
+    <div class="f"><span>遮挡 zOrder</span><input type="number" data-area-zorder value="${(a.zOrder | 0) || 0}" step="1">
+      <span class="u" title="RPE：zOrder 高者在上；相同则线号大的在上">高者在上</span></div>`;
   for (const k of ['centerX', 'centerY', 'width', 'height', 'rotation']) {
     const t = CORE.TRACK_BY_KEY[k];
     html += `<div class="f"><span>${t.label}</span>
@@ -5922,9 +6170,17 @@ function renderProps() {
       if (t.bool) {
         html += `<div class="f"><span>值</span><label class="chk"><input type="checkbox" data-ev="boolval" ${e.a ? 'checked' : ''}> ${e.a ? 'true' : 'false'}（布尔轨不使用缓动）</label></div>`;
       } else {
-        html += `<div class="f"><span>起始值</span><input type="number" data-ev="a" value="${rnd(e.a, 3)}"><button class="mini" data-sync="${track}" data-syncfield="a" title="把预览当前值写入【起始值】">⟲</button></div>
-          <div class="f"><span>终止值</span><input type="number" data-ev="b" value="${rnd(e.b, 3)}"><button class="mini" data-sync="${track}" data-syncfield="b" title="把预览当前值写入【终止值】">⟲</button></div>
-          <div class="f"><span>缓动 id</span>
+        if (t.colorTrack) {
+          html += `<div class="f"><span>起始颜色</span><input type="color" data-ev="colorA" value="${CORE.colorHex(e.a)}">
+              <span class="mono" style="font-size:11px;color:var(--dim)">${CORE.colorHex(e.a)}</span></div>
+            <div class="f"><span>终止颜色</span><input type="color" data-ev="colorB" value="${CORE.colorHex(e.b)}">
+              <span class="mono" style="font-size:11px;color:var(--dim)">${CORE.colorHex(e.b)}</span></div>
+            <div class="empty" style="padding:0">颜色事件写进 RPE 的 <b>extended.colorEvents</b>；默认色 = 255,84,84。</div>`;
+        } else {
+          html += `<div class="f"><span>起始值</span><input type="number" data-ev="a" value="${rnd(e.a, 3)}"><button class="mini" data-sync="${track}" data-syncfield="a" title="把预览当前值写入【起始值】">⟲</button></div>
+            <div class="f"><span>终止值</span><input type="number" data-ev="b" value="${rnd(e.b, 3)}"><button class="mini" data-sync="${track}" data-syncfield="b" title="把预览当前值写入【终止值】">⟲</button></div>`;
+        }
+        html += `<div class="f"><span>缓动 id</span>
             <input type="number" id="easeId" min="1" max="31" step="1" value="${e.easing | 0}">
             <span class="u" style="min-width:70px;text-align:right">${CORE.RPE_EASE_NAMES[e.easing] || ''}</span></div>
           <div class="f"><span>方向/类型</span>
@@ -5988,7 +6244,8 @@ function ensureNow() {
   if (S.now) return S.now;
   const tBeat = S.bpm.beat(S.time);
   const st = CORE.areaState(S.areas[S.sel], tBeat, S.aspect, null);
-  S.now = { centerX: st.centerX, centerY: st.centerY, width: st.width, height: st.height, rotation: st.rotation, anchor: null };
+  S.now = { centerX: st.centerX, centerY: st.centerY, width: st.width, height: st.height,
+            rotation: st.rotation, color: CORE.colorCopy(st.color), anchor: null };
   return S.now;
 }
 
@@ -6010,11 +6267,20 @@ function writeTrackAt(track, tBeat, v) {
   if (!a) return 0;
   const evs = a.tracks[track];
   if (!evs) return 0;
-  if (!isFinite(v)) return 0;
+  const tk = TRACK_BY_KEY[track];
+  if (tk && tk.colorTrack) {
+    if (!isColorVal(v)) return 0;
+    v = colorCopy(v);
+  } else if (!isFinite(v)) return 0;
   const ci = CORE.eventCovering(evs, tBeat);
-  if (ci >= 0) { evs[ci].a = v; evs[ci].b = v; }
+  if (ci >= 0) {
+    evs[ci].a = tk && tk.colorTrack ? colorCopy(v) : v;
+    evs[ci].b = tk && tk.colorTrack ? colorCopy(v) : v;
+  }
   else {
-    const ev = { start: tBeat, end: tBeat + 1, a: v, b: v, easing: 1 };
+    const ev = { start: tBeat, end: tBeat + 1, easing: 1 };
+    ev.a = tk && tk.colorTrack ? colorCopy(v) : v;
+    ev.b = tk && tk.colorTrack ? colorCopy(v) : v;
     evs.push(ev); CORE.sortTrack(evs);
   }
   S.rev++;
@@ -6348,7 +6614,7 @@ function rKey() {
   const m = S.tlMouse;
   if (!m) return status('把鼠标移到时间轴上再按 R', 2500);
   const key = colToTrack(m.x);
-  if (!key) return status('把鼠标放到某一列上（右侧 7 列）', 2500);
+  if (!key) return status(`把鼠标放到某一列上（右侧 ${CORE.TRACKS.length} 列）`, 2500);
   const step = 1 / Math.max(1, S.snapN);
   const raw = yToBeat(m.y);
   const b = Math.round(raw / step) * step;
@@ -6372,7 +6638,9 @@ function rKey() {
   const cur = CORE.trackValueAt(S.areas[S.sel].tracks, track, s, null);
   const ev = t.bool
     ? { start: s, end: e2, a: !!cur, b: !!cur, easing: 1 }
-    : { start: s, end: e2, a: cur, b: cur, easing: 1 };
+    : t.colorTrack
+      ? { start: s, end: e2, a: CORE.colorCopy(cur), b: CORE.colorCopy(cur), easing: 1 }
+      : { start: s, end: e2, a: cur, b: cur, easing: 1 };
   const evs = S.areas[S.sel].tracks[track];
   evs.push(ev); CORE.sortTrack(evs);
   S.selEvent = { track, idx: evs.indexOf(ev) };
@@ -6388,8 +6656,28 @@ $('props').addEventListener('input', ev => {
   const a = S.areas[S.sel]; if (!a) return;
   const el = ev.target;
 
+  if (el.dataset.areaZorder != null) {       // 遮挡顺序（RPE zOrder）
+    a.zOrder = parseInt(el.value, 10) || 0;
+    S.rev++; renderStage(); renderTimeline();
+    return;
+  }
   if (el.dataset.cur) {
-    const k = el.dataset.cur, val = parseFloat(el.value) || 0;
+    const k = el.dataset.cur;
+    if (k === 'color') {                     // 彩色噪域：在播放头写颜色事件（或预览缓冲）
+      const c = CORE.colorFromHex(el.value);
+      if (!c) return;
+      const tB = S.bpm.beat(S.time);
+      if (S.liveEdit) {
+        writeTrackAt('color', tB, c);
+        S.now = null;
+        renderStage(); renderTimeline();
+      } else {
+        ensureNow().color = c;
+        renderStage();
+      }
+      return;
+    }
+    const val = parseFloat(el.value) || 0;
     // ★ 即时修改：几何轨当场写事件（visible/active 是 bool 轨，不在此列）
     if (S.liveEdit && ['centerX', 'centerY', 'width', 'height', 'rotation'].includes(k)) {
       const tB = S.bpm.beat(S.time);
@@ -6458,6 +6746,11 @@ $('props').addEventListener('input', ev => {
     const f = el.dataset.ev;
     if (f === 'start' || f === 'end') { e[f] = parseFloat(el.value) || 0; CORE.sortTrack(a.tracks[track]); }
     else if (f === 'a' || f === 'b') e[f] = parseFloat(el.value) || 0;
+    else if (f === 'colorA' || f === 'colorB') {
+      const c = CORE.colorFromHex(el.value);
+      if (c) e[f === 'colorA' ? 'a' : 'b'] = c;
+      else return;
+    }
     else if (f === 'ax' || f === 'ay') {
       e[f] = parseFloat(el.value) || 0;
       // ★ 缩放锚点 width/height 成对写：官方 scaleEvents 每个关键帧只有一个 anchor，
@@ -6667,9 +6960,11 @@ $('props').addEventListener('click', ev => {
     const evs = a.tracks[track], e = evs[idx];
     if (!(tBeat > e.start && tBeat < e.end)) return status('播放头不在该事件区间内', 2500);
     pushUndo();
-    const mid = CORE.evalNum(evs, tBeat, 0);
-    const right = { start: tBeat, end: e.end, a: mid, b: e.b, easing: e.easing };
-    e.end = tBeat; e.b = mid;
+    const isC = !!(CORE.TRACK_BY_KEY[track] && CORE.TRACK_BY_KEY[track].colorTrack);
+    const mid = isC ? CORE.evalColor(evs, tBeat, CORE.NOISE_DEFAULT_COLOR) : CORE.evalNum(evs, tBeat, 0);
+    const right = { start: tBeat, end: e.end,
+      a: isC ? CORE.colorCopy(mid) : mid, b: isC ? CORE.colorCopy(e.b) : e.b, easing: e.easing };
+    e.end = tBeat; e.b = isC ? CORE.colorCopy(mid) : mid;
     evs.push(right); CORE.sortTrack(evs);
     S.selEvent = { track, idx: evs.indexOf(right) };
     S.rev++; renderAll();
@@ -8197,7 +8492,8 @@ function exportOfficial() {
   const o = buildOfficialObj();
   if (!o) return status('尚未载入谱面', 2500);
   download(new Blob([JSON.stringify(o)], { type: 'application/json' }), (S.docName || 'chart') + '.official.json');
-  status('已导出官方格式：' + o.judgeLineList.length + ' 条判定线 / ' + o.blockAreaList.length + ' 个噪域', 4000);
+  status('已导出官方格式：' + o.judgeLineList.length + ' 条判定线 / ' + o.blockAreaList.length + ' 个噪域'
+    + (CORE.areasHaveColor(S.areas) ? '；⚠ 官方格式不支持彩色噪域：颜色已丢弃（要保留颜色请用「导出 RPE」并勾选「RPE 含噪域线」）' : ''), 7000);
 }
 
 /** 导出 .pez（zip：谱面 json + 音乐 + 插图 + info.txt） */
