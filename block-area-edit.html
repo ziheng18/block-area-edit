@@ -4922,6 +4922,7 @@ const S = {
   doc: null, docName: '', format: 'rpe',
   bpm: null, areas: [], total: 1,
   aspect: 3 / 2, time: 0, playing: false,
+  areasDirty: false,               // 是否编辑过 S.areas（→ 不再原样保留 RPE Next 的 blockAreaList）
   sel: -1, selEvent: null, selEvents: [], clip: null,          // 事件剪贴板 {anchor, items[]}          // multiselect [{track,idx}]        // {track, idx}
   snapN: 4, pxPerBeat: 60, tlB0: 0, tlH: 0,
   pending: null,                  // {track, start, end} 等待事件尾
@@ -4991,6 +4992,7 @@ function doRedo() {
   afterChange(false);
 }
 function afterChange(resetSel) {
+  S.areasDirty = true;
   if (resetSel) { S.sel = -1; S.selEvent = null; }
   if (S.sel >= S.areas.length) S.sel = S.areas.length - 1;
   S.now = null; S.pending = null; S.rev++;
@@ -5007,6 +5009,7 @@ function loadRpe(text, name) {
   S.srcDoc = doc;                       // RPE：源谱面就是 S.doc 本身
   S.bpm = new CORE.BpmList(doc.BPMList);
   S.areas = CORE.parseAreas(doc.blockAreaList, S.bpm);
+  S.areasDirty = false;
   S.notes = collectNotesRpe(doc);
   rebuildLines();
   // ★ 社区约定的 Recorder 噪域线 → 追加为噪域（Texture = isSubtract0/1.png）
@@ -5054,6 +5057,7 @@ function loadNoiseList(list, name, bpmGuess) {
   };
   S.srcDoc = { formatVersion: 3, offset: 0, judgeLineList: [], blockAreaList: list };
   S.docName = name || 'blockAreaList'; S.format = 'phi'; S.bpm = bpm; S.areas = areas;
+  S.areasDirty = false;
   S.notes = [];
   rebuildLines();
   S.undo.length = 0; S.redo.length = 0; S.sel = areas.length ? 0 : -1; S.selEvent = null;
@@ -5090,6 +5094,7 @@ function loadOfficial(text, name) {
     judgeLineList: [],
   };
   S.docName = name || 'imported'; S.format = 'phi'; S.bpm = bpm; S.areas = areas;
+  S.areasDirty = false;
   S.srcDoc = doc;                       // ★ 官方谱：保留原始文档（含 judgeLineList）供建线用
   S.notes = collectNotesOfficial(doc, bpmVal);
   rebuildLines();
@@ -5108,6 +5113,7 @@ function newDoc() {
   S.docName = 'new'; S.format = 'rpe'; S.bpm = new CORE.BpmList(S.doc.BPMList);
   S.srcDoc = S.doc;
   S.areas = [makeArea(0)]; S.notes = []; S.lines = [];
+  S.areasDirty = false;
   S.undo.length = 0; S.redo.length = 0; S.sel = 0; S.selEvent = null;
   computeTotal(); S.time = 0; S.rev++;
   renderAll();
@@ -5166,9 +5172,13 @@ function buildRpeObj(opts) {                    // 供「导出 RPE」「写回�
   // ★ RPE 谱面的 blockAreaList：外部加载器（RPE Next / 新版 RPE 工具）按 next schema 读
   //   （bottomLeft/topRight + Beat 三元组）。这里统一写 next schema；native 官谱形状只用于
   //   「导出官方 / 官方 pez / 仅导出噪域数据」（RPE Recorder 的原生官谱噪域入口）。
-  //   否则普通 RPE 导出会写 bottomLeftPercentage，next 加载器报
-  //   `blockAreaList[0].bottomLeft: 坐标必须包含有限 x/y`。
-  obj.blockAreaList = CORE.nextBlockAreas(S.areas, S.bpm, chartEnd, S.aspect);
+  //   若源谱本身就是 RPE Next 且噪域没被编辑过，直接原样保留它的 blockAreaList
+  //   （import → export 对 next 噪域是无损的，不经过内部近似重建）。
+  const keepRawNext = S.format === 'rpe' && S.doc && !S.areasDirty &&
+    CORE.isRpeNextDoc(S.doc) && Array.isArray(S.doc.blockAreaList) && S.doc.blockAreaList.length;
+  obj.blockAreaList = keepRawNext
+    ? JSON.parse(JSON.stringify(S.doc.blockAreaList))
+    : CORE.nextBlockAreas(S.areas, S.bpm, chartEnd, S.aspect);
   return obj;
 }
 /** 当前导出对象里 Line2Area（Texture=isSubtract*）判定线的条数（状态提示用） */
