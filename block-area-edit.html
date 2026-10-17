@@ -1129,21 +1129,28 @@ const safeDiv = (a, b) => (Math.abs(b) < 1e-30 ? 1 : a / b);
        存储式：ax = -(px - 0.5) * wB、ay = -(py - 0.5) * hB，px/py ∈ [0,1] 是矩形自身的归一化支点。
    旧的推断规则（recNoise → rect）只在【字段缺失】时兜底；读写一律先看 anchorModeOf。 */
 
-/** rect 模式的【基准尺寸】：与 anchorDisp 分支一同一个读法（宽/高轨首事件的绝对值，缺省全屏） */
+/** rect 模式的【基准尺寸】：与 anchorDisp 分支一同一个读法（宽/高轨首事件，缺省全屏）。
+ *  ★ 取绝对值：渲染路径 transformOfState 用 Math.abs(宽高)，负宽高（导入/手输都可达）
+ *    若在支点换算里保留符号，位移会翻到错误的一侧（实测 -600 宽时中心偏到反方向）。 */
 function baseSizeOf(area) {
   const T = (area && area.tracks) || area || {};
   const W = T.width || [], H = T.height || [];
-  return { w: W.length ? W[0].a : RPE_WIDTH, h: H.length ? H[0].a : RPE_HEIGHT };
+  return {
+    w: W.length ? Math.abs(+W[0].a || 0) : RPE_WIDTH,
+    h: H.length ? Math.abs(+H[0].a || 0) : RPE_HEIGHT,
+  };
 }
 /** 归一化支点 [0,1] -> rect 模式的存储值 ax/ay（基准尺寸位移） */
 function rectPivotToAnchor(p, wB, hB) {
-  return { x: -(p.x - 0.5) * wB, y: -(p.y - 0.5) * hB };
+  const W = Math.abs(wB) > 1e-9 ? Math.abs(wB) : 1;
+  const H = Math.abs(hB) > 1e-9 ? Math.abs(hB) : 1;
+  return { x: -(p.x - 0.5) * W, y: -(p.y - 0.5) * H };
 }
 /** rect 模式的存储值 ax/ay -> 归一化支点 [0,1]（rectPivotToAnchor 的逆） */
 function anchorToRectPivot(ax, ay, wB, hB) {
   return {
-    x: 0.5 - ((+ax || 0) / (Math.abs(wB) > 1e-9 ? wB : 1)),
-    y: 0.5 - ((+ay || 0) / (Math.abs(hB) > 1e-9 ? hB : 1)),
+    x: 0.5 - ((+ax || 0) / (Math.abs(wB) > 1e-9 ? Math.abs(wB) : 1)),
+    y: 0.5 - ((+ay || 0) / (Math.abs(hB) > 1e-9 ? Math.abs(hB) : 1)),
   };
 }
 /** rect 模式实际生效的存储值：与 anchorDisp 分支一同一个读法 ——
@@ -1170,13 +1177,34 @@ function setRectAnchor(area, ax, ay) {
   }
   return n;
 }
+/** 缩放锚点【成对】写入：官方 scaleEvents 每个关键帧只有一个 anchor（x/y 共用），
+ *  编辑器把它同时存在 width / height 两条轨上，而 anchorDisp 的缩放链只重放 width 事件。
+ *  ⇒ 只改一条会让另一条变成"看着能改、其实不生效"的死数据；这里按同一 start 同步。
+ *  返回同步到的另一条轨事件数（0 = 没有配对的 height/width 事件）。 */
+function setScaleAnchorPair(area, track, ev, ax, ay) {
+  if (!ev || (track !== 'width' && track !== 'height')) return 0;
+  const T = (area && area.tracks) || area;
+  if (!T) return 0;
+  // 缺省 anchor = 基准中心（与 anchorDisp 的 offC 读法一致），同步时写成有效值
+  const AX = (ax == null || !isFinite(ax)) ? (area.bx || 0) : ax;
+  const AY = (ay == null || !isFinite(ay)) ? (area.by || 0) : ay;
+  const other = track === 'width' ? 'height' : 'width';
+  let n = 0;
+  for (const o of (T[other] || [])) {
+    if (Math.abs((o.start || 0) - (ev.start || 0)) < 1e-9) { o.ax = AX; o.ay = AY; n++; }
+  }
+  return n;
+}
 /** rect 模式：由「归一化支点 + 矩形当前中心/尺寸/角度」正推【枢轴点】（局部 RPE 坐标）。
  *  ★ 旋转留在 chart 空间做（RPE→chart 是各向异性的，aspect ≠ 1 时与"RPE 里直接转"不等价），
  *    与 anchorDisp 分支一逐式对应，否则面板显示的枢轴会和画面上画的对不上。 */
 function rectPivotPoint(center, p, width, height, rotDeg, aspect) {
   const A = aspect || DEFAULT_ASPECT;
   const kx = 1 / (RPE_WIDTH / 2), ky = 1 / ((RPE_HEIGHT / 2) * A);
-  const dxr = (p.x - 0.5) * width, dyr = (0.5 - p.y) * height;
+  // ★ 与 rectPivotOfPoints / transformOfState 统一用【尺寸绝对值】：
+  //   负宽高在渲染里按正尺寸画，若这里保留符号，p -> P -> p 就不再互逆
+  //   （实测负宽度下 p.x=0.2 反算回来变成 0.8）。
+  const dxr = (p.x - 0.5) * Math.abs(width), dyr = (0.5 - p.y) * Math.abs(height);
   const r = (rotDeg || 0) * Math.PI / 180, cs = Math.cos(r), sn = Math.sin(r);
   const X = dxr * kx, Y = dyr * ky;
   return { x: center.x - (cs * X - sn * Y) / kx, y: center.y - (sn * X + cs * Y) / ky };
@@ -1264,16 +1292,20 @@ function convertAnchorMode(area, to, tBeat, aspect) {
     P = rectPivotPoint({ x: st.centerX, y: st.centerY }, p, st.width, st.height, st.rotation, A);
   }
   area.anchorMode = 'abs';
+  const evs = T.rotation || [];
+  if (!evs.length) {
+    T.rotation = [{ start: Math.max(0, t0), end: Math.max(0, t0) + 1, a: 0, b: 0, easing: 1 }];
+  }
   if (!P) {                                        // 没有相对支点可换算 → 全部锚点写基准中心（a=0 ⇒ d≡0）
     setRectAnchor(area, area.bx || 0, area.by || 0);
     return true;
   }
-  const evs = T.rotation || [];
-  if (!evs.length) {
-    T.rotation = [{ start: Math.max(0, t0), end: Math.max(0, t0) + 1, a: 0, b: 0, easing: 1, ax: P.x, ay: P.y }];
-  } else {
-    for (const e of evs) { e.ax = P.x; e.ay = P.y; }
-  }
+  // ★★ 枢轴必须写到【所有带 anchor 的几何轨】上，不能只写旋转轨：
+  //    rect 的支点同时承担"绕哪转"与"绕哪长大"（Line2Area 只有一个支点），
+  //    换成 abs 后官方链会分别读 width（缩放链）与 rotation（旋转链）的 anchor。
+  //    旧写法只写旋转轨，width/height 上还留着 rect 的【基准尺寸位移】（±几百），
+  //    被当成绝对点用 ⇒ 缩放链凭空多出一段位移（实测尺寸动画的区域中心差 ~72 RPE）。
+  setRectAnchor(area, P.x, P.y);
   return true;
 }
 
@@ -1288,21 +1320,27 @@ function rebaseCenter(area, bx, by) {
   const nb = +bx || 0, ny = +by || 0;
   const dx = nb - (area.bx || 0), dy = ny - (area.by || 0);
   if (!isFinite(dx) || !isFinite(dy)) return false;
-  const seen = new Set();
-  const shift = (e) => {
-    if (!e || seen.has(e)) return;
-    seen.add(e);
-    if (e.ax != null && isFinite(e.ax)) e.ax = e.ax + dx;
-    if (e.ay != null && isFinite(e.ay)) e.ay = e.ay + dy;
-  };
-  for (const k in T) {
-    const tr = T[k];
-    if (!Array.isArray(tr)) continue;
-    for (const e of tr) {
-      if (Array.isArray(e)) { for (const q of e) shift(q); }   // 事件层（layers）
-      else shift(e);
+  // ★★ rect 模式的 ax/ay 是【基准尺寸位移】，不是绝对点 —— 平移它等于移动支点，
+  //    画面会跟着动（实测改 bx/by 后中心偏 223 RPE），与"改基准中心 = 只换参照系"矛盾。
+  //    rect 的位移根本不经过 bx/by（anchorDisp 分支一只用支点与尺寸），所以不碰它。
+  const isRect = anchorModeOf(area) === 'rect';
+  if (!isRect) {
+    const seen = new Set();
+    const shift = (e) => {
+      if (!e || seen.has(e)) return;
+      seen.add(e);
+      if (e.ax != null && isFinite(e.ax)) e.ax = e.ax + dx;
+      if (e.ay != null && isFinite(e.ay)) e.ay = e.ay + dy;
+    };
+    for (const k in T) {
+      const tr = T[k];
+      if (!Array.isArray(tr)) continue;
+      for (const e of tr) {
+        if (Array.isArray(e)) { for (const q of e) shift(q); }   // 事件层（layers）
+        else shift(e);
+      }
+      if (tr.layers) for (const g of tr.layers) for (const e of (g || [])) shift(e);
     }
-    if (tr.layers) for (const g of tr.layers) for (const e of (g || [])) shift(e);
   }
   area.bx = nb; area.by = ny;
   return true;
@@ -1343,9 +1381,13 @@ function chainActivity(area, tBeat) {
   const H = pick(T.height, tBeat);
   out.rot = mag(R) > 1e-6 && Math.abs((R.b || 0) - (R.a || 0)) > 1e-9;
   out.rotAnchor = mag(R) > 1e-6 ? currentAnchor(area, tBeat) : null;
-  const sBest = mag(H) > mag(W) ? H : W;
-  out.scale = mag(sBest) > 1e-6 && Math.abs((sBest.b || 0) - (sBest.a || 0)) > 1e-9;
-  out.scaleAnchor = mag(sBest) > 1e-6 ? scaleAnchorOf(area, tBeat) : null;
+  // ★ 缩放链的锚点【只认 width 轨】：anchorDisp 分支二的缩放段就是按 width 事件重放的，
+  //   以前这里取 |anchor| 较大的那条（可能是 height），而 height 的 anchor 根本不参与求值 ⇒
+  //   面板会谎报"缩放链在推中心"。尺寸是否在变则两轴任一即可。
+  const sizeMoving = (!!W && Math.abs((W.b || 0) - (W.a || 0)) > 1e-9)
+                  || (!!H && Math.abs((H.b || 0) - (H.a || 0)) > 1e-9);
+  out.scale = mag(W) > 1e-6 && sizeMoving;
+  out.scaleAnchor = out.scale ? scaleAnchorOf(area, tBeat) : null;
   return out;
 }
 
@@ -1407,9 +1449,12 @@ function anchorDisp(area, tBeat, aspect) {
   //     几何必须跟着新语义走；靠 `recNoise` 推断会让"切了模式但没生效"这种静默错。
   //   （`anchorModeOf` 在字段缺失时仍按来源兜底，保证旧数据/旧暂存文件不炸。）
   if (anchorModeOf(area) === 'rect') {
-    const wB = W.length ? W[0].a : RPE_WIDTH, hB = H.length ? H[0].a : RPE_HEIGHT;
-    const wN = W.length ? evalNum(W, tBeat, wB) : wB;
-    const hN = H.length ? evalNum(H, tBeat, hB) : hB;
+    // ★ 尺寸取【绝对值】（渲染路径 transformOfState 也是 Math.abs）：
+    //   负宽高若保留符号，支点位移会翻到错误一侧（与 baseSizeOf / rectPivot* 同一口径）。
+    const wB = W.length ? Math.abs(W[0].a) : RPE_WIDTH;
+    const hB = H.length ? Math.abs(H[0].a) : RPE_HEIGHT;
+    const wN = W.length ? Math.abs(evalNum(W, tBeat, wB)) : wB;
+    const hN = H.length ? Math.abs(evalNum(H, tBeat, hB)) : hB;
     let ax = 0, ay = 0;
     for (const key of ['centerX', 'width', 'rotation']) {
       const e = (T[key] || [])[0];
@@ -2601,6 +2646,12 @@ function toOfficialOne(areas, bpm, win, aspect, chartEnd) {
     //   ② 噪域线来源（无 recTimes，production 路径）：a.bx/a.by 是【判定线位置】不是场中心 ✗
     //      → 框必须按【出现时刻的实际几何】算：中心 = evalNum(center, tRef)，尺寸 = evalNum(size, tRef)
     const fromOff = !!a.recTimes;
+    // ★★ 官方来源也要看【用户有没有改语义】：一旦切成 rect（或打开简单模式），
+    //    编辑器就不再按官方锚点链求值 ⇒ 导出不能再"原值还原 anchor + 只发几何关键帧"，
+    //    否则读端会把原 anchor 再算一遍（实测：官方源切 rect 后往返中心差最大 1580 RPE，
+    //    切简单模式最大 1439 RPE）。判定与恒等门槛一致：只有【abs + 非简单模式】才原值还原。
+    const neutralOff = !!a.lockAnchor || anchorModeOf(a) !== 'abs';
+    const fromOffAbs = fromOff && !neutralOff;
     // ★★ 绝对模式（非官方来源、无父线）：官方链能自己算出「公转」⇒ 导出要【如实写事件的 anchor】，
     //    只把差额（渲染中心 − 官方链位移）烘进 moveEvents。
     //    否则会出现"编辑器里 anchor 产生公转、导出去的 anchor 却不产生"——
@@ -2610,6 +2661,10 @@ function toOfficialOne(areas, bpm, win, aspect, chartEnd) {
     //    这条路上"烘进去的差额"恰好就是【中心轨本身】（因为 abs 的渲染中心 = 轨道值 + 链位移），
     //    所以网格不必再并进 宽/高/角度（省下大量关键帧），而 anchor 保住真实枢轴。
     const fromAbs = !fromOff && !a.lockAnchor && !a.parentLine && anchorModeOf(a) === 'abs';
+    // ★ 几何是否必须【重新密采样】：官方来源且仍按官方链求值 → 原关键帧就够（保住缓动编号）；
+    //   其余（含官方源切 rect）都要把 d 烘进几何 ⇒ 走密集线性关键帧。
+    //   官方源切【简单模式】时 d ≡ 0，原关键帧仍然成立 ⇒ 只换中性 anchor，几何不重采。
+    const denseGeom = !fromOff || (neutralOff && !a.lockAnchor);
     // ★ 不取反：噪域线的 centerX 轨道值本身就是官方格式要的坐标。
     //   镜像发生在【锚点位移】上（anchorDisp 里 X = -ax·sx·kx），不是发生在轨道值上。
     //   实测：源 centerX=-400 / 导回=+400 就是这里多取了一次反。
@@ -2663,8 +2718,9 @@ function toOfficialOne(areas, bpm, win, aspect, chartEnd) {
     //   中心差 400，可通过编辑器自己的 JSON 触发）。
     const localCenter = (tt) => {
       const bx0 = evalNum(cx, tt, a.bx || 0), by0 = evalNum(cy, tt, a.by || 0);
-      // ★ 官方来源 & 绝对模式：烘进去的是【差额】= 轨道值本身（链位移由读端按 anchor 重算）
-      if (fromOff || fromAbs) return { x: bx0, y: by0 };
+      // ★ 官方链仍有效（官方来源 abs / 绝对模式）：烘进去的是【差额】= 轨道值本身
+      //   （链位移由读端按 anchor 重算）。切成 rect / 简单模式后链不再成立 ⇒ 必须把 d 烘进去。
+      if (fromOffAbs || fromAbs) return { x: bx0, y: by0 };
       const d = anchorDisp({ tracks: T, bx: a.bx, by: a.by, lockAnchor: a.lockAnchor, recNoise: a.recNoise, anchorMode: anchorModeOf(a) }, tt, aspect || DEFAULT_ASPECT);
       return { x: bx0 + (d ? d.x : 0), y: by0 + (d ? d.y : 0) };
     };
@@ -2686,7 +2742,7 @@ function toOfficialOne(areas, bpm, win, aspect, chartEnd) {
     //   官方来源：ax/ay 本来就是绝对点（fromOfficial 用 pctToRpe(e.anchor) 存进来的）
     //   噪域线来源：ax/ay 是【相对场中心的偏移】→ 必须加上当时的场中心，否则官方链把它当绝对点用，偏移会翻倍
     const ancOf = (e, tt) => {
-      if ((fromOff || fromAbs) && e && e.ax != null) {
+      if ((fromOffAbs || fromAbs) && e && e.ax != null) {
         // 官方来源 / 绝对模式：ax/ay 本来就是【绝对点】（fromOfficial 用 pctToRpe(e.anchor) 存进来的）
         // → 如实写出（公转由读端的官方链按这个 anchor 重算）。
         // ★ 不做 toFixed(6)：截到 6 位 pct 会把值量化掉 ~1e-6（≈0.0014 RPE）。
@@ -2701,7 +2757,7 @@ function toOfficialOne(areas, bpm, win, aspect, chartEnd) {
       return mkAnchor(c0x, c0y);
     };
     const evsR = (R.length ? R : [{ start: 0, end: 1, a: 0, b: 0, easing: 1 }]).filter(inWin);
-    const rotateEvents = !fromOff
+    const rotateEvents = denseGeom
       // ★ 旋转也走【同一张密集线性网格】。原先走"缓动编号"路径有两个坑：
       //   ① 某条轨首事件之前的默认值用了 valAt（保持首值）而不是渲染默认 0 → 满量程错；
       //   ② 窗口裁切后仍写原 easeType，等于把原缓动重新映射到子区间 → 子曲线错（实测 4.05°）；
@@ -2728,8 +2784,8 @@ function toOfficialOne(areas, bpm, win, aspect, chartEnd) {
         })();
     const moveEvents = [];
     const times = new Set([...cx.map(e => e.start), ...cy.map(e => e.start)]);
-    // ★ 同上：官方来源要补中心轨的末关键帧时刻
-    if (fromOff) {
+    // ★ 同上：官方来源要补中心轨的末关键帧时刻（只走原关键帧路径时）
+    if (!denseGeom) {
       if (cx.length) times.add(cx[cx.length - 1].end);
       if (cy.length) times.add(cy[cy.length - 1].end);
     }
@@ -2741,7 +2797,7 @@ function toOfficialOne(areas, bpm, win, aspect, chartEnd) {
     //   取值一律走 renderCenter（= 渲染真值），因此顺带覆盖：
     //     · 父线公转：世界 = 父线坐标(t) + R(父线角度(t))·自身(t)，与自身关键帧【不同步】
     //     · 支点位移：disp = R(rot(t))·anchor·size(t)，是角度的正弦函数 —— 极值常在关键帧之间
-    if (!fromOff) {
+    if (denseGeom) {
       // ★ 只有真正会造成【非线性】的轨才需要并进网格，否则关键帧数会白白翻十几倍：
       //   · 父线链：公转 = 世界位置随每一级祖先的动画变化
       //   · 支点位移：disp = R(rot(t))·anchor·size(t) —— 只有 anchor≠0 时才依赖 宽/高/角度
@@ -2768,7 +2824,7 @@ function toOfficialOne(areas, bpm, win, aspect, chartEnd) {
         moveEvents.push({ endPosition: mkAnchor(kf.v[0], kf.v[1]), time: +sec(kf.t).toFixed(9), easeTypeX: kf.ez || 0, easeTypeY: kf.ez || 0 });
       }
     }
-    for (const tt of (fromOff ? timesF.sort((x, y) => x - y) : [])) {
+    for (const tt of (!denseGeom ? timesF.sort((x, y) => x - y) : [])) {
       const ex = cx.find(e => Math.abs(e.start - tt) < 1e-9), ey = cy.find(e => Math.abs(e.start - tt) < 1e-9);
       moveEvents.push({
         // 事件起点沿用原值（保真）；【补的末关键帧】没有对应起点 → 用轨道求值
@@ -2779,13 +2835,13 @@ function toOfficialOne(areas, bpm, win, aspect, chartEnd) {
     }
     const W = T.width || [], H = T.height || [];
     const st = new Set([...W.map(e => e.start), ...H.map(e => e.start)]);
-    // ★ 同上：官方来源要补宽高轨的末关键帧时刻
-    if (fromOff) {
+    // ★ 同上：走原关键帧路径时要补宽高轨的末关键帧时刻
+    if (!denseGeom) {
       if (W.length) st.add(W[W.length - 1].end);
       if (H.length) st.add(H[H.length - 1].end);
     }
     const stF = [...st].filter(tt => !win || (tt >= win[0] - 1e-9 && tt <= win[1] + 1e-9));
-    const scaleEvents = !fromOff
+    const scaleEvents = denseGeom
       ? (() => {
           // ★ 与 moveEvents 同理：宽高合成一条 scaleEvents，x/y 各带 easeTypeX/easeTypeY，
           //   任一轴在"另一轴的关键帧时刻"缺席就会被打断缓动 —— 两轴共用同一张细网格。
@@ -2796,8 +2852,17 @@ function toOfficialOne(areas, bpm, win, aspect, chartEnd) {
           //   之前的写法是"先除后细分"，tol=4 就变成了 4 个【倍率】= 4×1350 RPE 单位，
           //   于是尺寸轨几乎从不细分/标记 —— 实测窗口末端宽度 89.95 被压成 55.07。
           const sValRpe = (t) => [evalNum(W, t, RPE_WIDTH), evalNum(H, t, RPE_HEIGHT)];
+          // ★★ 绝对模式也要如实写【缩放枢轴】：官方链的缩放段同样按 anchor 重放，
+          //   以前这里固定写中性点（基准框中心），于是 width 事件上的偏心 anchor
+          //   （= 官方的 scaleEvents[].anchor，例如"绕下边缘长大"）被静默丢掉，
+          //   导回后中心差实测 360 RPE。密集子段继承【覆盖该时刻的 width 事件】的 anchor。
+          const scaleAnc = (t) => {
+            if (!fromAbs) return null;
+            const i = lastStartLE(W, t);
+            return i >= 0 ? W[i] : null;
+          };
           return denseKeys(denseGridTimes(tRef, tEnd, [{ tr: W, delta: POS_SUB_UNITS }, { tr: H, delta: POS_SUB_UNITS }], null), sValRpe, POS_SUB_UNITS / 2).map(kf => ({
-            anchor: ancOf(null, kf.t), time: +sec(kf.t).toFixed(9), easeTypeX: kf.ez || 0, easeTypeY: kf.ez || 0,
+            anchor: ancOf(scaleAnc(kf.t), kf.t), time: +sec(kf.t).toFixed(9), easeTypeX: kf.ez || 0, easeTypeY: kf.ez || 0,
             scale: { x: +(kf.v[0] / (w0 || 1)).toFixed(6), y: +(kf.v[1] / (h0 || 1)).toFixed(6) },
           }));
         })()
@@ -2848,7 +2913,7 @@ function toOfficialOne(areas, bpm, win, aspect, chartEnd) {
     //     它们承载真实的跳变语义，去掉会让导回渲染偏到 547 单位（实测）。
     const dedupTime = (evs, getT) => {
       evs.sort((p, q) => getT(p) - getT(q));
-      if (fromOff) return evs;
+      if (!denseGeom) return evs;
       const o = [];
       for (const e of evs) {
         const last = o[o.length - 1];
@@ -3067,7 +3132,7 @@ const CORE = {
   TWEEN, RPE_EASE_ID, RPE_EASE_NAMES, rpeEase, evalNum, evalBool, lastStartLE,
   EASE_MAJORS, EASE_MINORS, easeParts, easeFromParts, TWEEN_TO_RPE,
   TRACKS, TRACK_BY_KEY, emptyTracks, newArea, areaState, anchorDisp, currentAnchor, anchorOffset, anchorModeOf, safeDiv, trackValueAt, sortTrack, eventCovering,
-  baseSizeOf, storedRectAnchor, rectPivotToAnchor, anchorToRectPivot, setRectAnchor, rectPivotPoint, rectPivotOfPoints, localStateOf, localPointOf, toWorld, absPointToRectPivot, convertAnchorMode, rebaseCenter, scaleAnchorOf, chainActivity, rotationCenterOf, trackSig, lifeSig,
+  baseSizeOf, storedRectAnchor, rectPivotToAnchor, anchorToRectPivot, setRectAnchor, setScaleAnchorPair, rectPivotPoint, rectPivotOfPoints, localStateOf, localPointOf, toWorld, absPointToRectPivot, convertAnchorMode, rebaseCenter, scaleAnchorOf, chainActivity, rotationCenterOf, trackSig, lifeSig,
   matMul, matInvert, matApply, matrixOf, quadCorners, transformOfState,
   touchInsetWorld, insetLocal, prepareBlockers, coverageAt, machineRendered, touchCoverage,
   kfToEvents, boolSpan, fromOfficial, fromV2, toJson, parseAreas, simplifyCorridor, simplifyKeys, snapshotAreas, restoreAreas, snapshotDoc, restoreDoc, nudgeEvents,
@@ -4683,7 +4748,7 @@ function renderProps() {
           + ` —— 粉十字标在${mark}`;
       })()}</span></div>
       <div class="btns"><button class="mini" data-act="pivotSelf" title="所有几何事件的锚点 = 基准中心 ⇒ a=0 ⇒ 全程 d≡0：只平移 + 自转">= 自身中心（自转）</button>
-        <button class="mini" data-act="anchorToCenter" title="把此刻的方块中心钉成世界固定点，此后绕它公转">= 当前中心（钉住）</button>
+        <button class="mini" data-act="anchorToCenter" title="把【实际转动中心 M+a】钉在此刻的方块中心（a = 当前锚点位移 d ⇒ anchor = 基准中心 + d）；d = 0 时本就绕自身中心转，点了不会变">= 当前中心（钉住）</button>
         <button class="mini" data-act="syncAnchor" title="把预览里拖出的枢轴写进当前时刻的旋转事件">⟲ 写入</button></div>` : ''}
     <div class="f"><span>对侧换算</span><span class="mono" style="font-size:11px;color:var(--dim)">${counterTxt}</span></div>
     <div class="empty" style="padding:0 0 4px">${modeNote}${S.now && S.now.anchor ? '<br>● 枢轴已改动（点 ⟲ 写入）' : ''}</div>
@@ -4696,7 +4761,7 @@ function renderProps() {
             <input type="number" data-ev="ax" value="${rnd(selEv.ev.ax != null ? selEv.ev.ax : (a.bx || 0), 3)}">
             <input type="number" data-ev="ay" value="${rnd(selEv.ev.ay != null ? selEv.ev.ay : (a.by || 0), 3)}"></div><span class="u">RPE</span></div>
           <div class="btns"><button class="mini" data-act="evPivotSelf" title="该事件锚点 = 基准中心 ⇒ 这一段只自转">= 自身中心（自转）</button>
-            <button class="mini" data-act="evAnchorToCenter" title="该事件锚点 = 此刻的方块中心（钉成世界固定点）">= 当前中心</button>
+            <button class="mini" data-act="evAnchorToCenter" title="该事件锚点 = 基准中心 + 当前锚点位移 d ⇒ 这一段的实际转动中心 M+a 落在「此刻的方块中心」上">= 当前中心</button>
             <button class="mini" data-act="syncAnchor" title="把预览里拖出的枢轴写进这个事件">⟲ 写入</button></div>
           <div class="empty" style="padding:0">${evAnchorNote}</div>`)
       : `<div class="empty" style="padding:0">选中时间轴上的「旋转 / 宽 / 高」事件后可精确编辑其 anchor。${
@@ -4857,6 +4922,19 @@ function pivotScreenOf(a, tBeat) {
       const My = CORE.evalNum(a.tracks.centerY || [], tBeat, a.by || 0);
       local = { x: Mx + (buf.x - (a.bx || 0)), y: My + (buf.y - (a.by || 0)) };
       anchorPt = { x: buf.x, y: buf.y };
+    } else if (CORE.anchorModeOf(a) === 'rect') {
+      // ★★ rect 的缓冲区存的是【基准尺寸位移】，不是世界点 ——
+      //   必须经 rectPivotPoint 换算成"矩形上那个真实支点"再画；
+      //   旧写法直接把位移当坐标，中心一离开原点粉十字就跑到原点附近（实测偏 323 RPE）。
+      const bs = CORE.baseSizeOf(a);
+      const bp = CORE.anchorToRectPivot(buf.x, buf.y, bs.w, bs.h);
+      const st0 = (S.now && S.now.centerX != null)
+        ? { centerX: S.now.centerX, centerY: S.now.centerY, width: S.now.width, height: S.now.height, rotation: S.now.rotation }
+        : (() => {
+            const q = CORE.localStateOf(a, tBeat, S.aspect);
+            return { centerX: q.centerX, centerY: q.centerY, width: q.width, height: q.height, rotation: q.rotation };
+          })();
+      local = CORE.rectPivotPoint({ x: st0.centerX, y: st0.centerY }, bp, st0.width, st0.height, st0.rotation, S.aspect);
     } else local = { x: buf.x, y: buf.y };
   } else local = { x: pickPt.x, y: pickPt.y };
   const w = CORE.toWorld(a, local, tBeat);
@@ -4902,7 +4980,10 @@ stage.addEventListener('mousedown', ev => {
   const hi = handleHit(ev);
   if (hi >= 0) { pushUndo(); S.drag = { mode: 'resize', corner: hi }; if (S.now) S.now.anchor = null; return; }
   // ★ 命中优先级：四角（缩放）> 枢轴（拖动锚点）> 整体（移动）
-  const pv = (S.sel >= 0) ? pivotScreenOf(S.areas[S.sel], tBeat) : null;
+  //   ★ 简单模式下锚点被忽略（anchorDisp 直接返回 0）：枢轴只是个参考点，
+  //     拖它不会产生任何效果，却会静默改掉 anchor ⇒ 不进入枢轴拖拽。
+  const selA = (S.sel >= 0) ? S.areas[S.sel] : null;
+  const pv = (selA && !selA.lockAnchor) ? pivotScreenOf(selA, tBeat) : null;
   if (pv) {
     const { rect } = stageView();
     const sx = ev.clientX - rect.left, sy = ev.clientY - rect.top;
@@ -5244,7 +5325,12 @@ $('props').addEventListener('input', ev => {
     const f = el.dataset.ev;
     if (f === 'start' || f === 'end') { e[f] = parseFloat(el.value) || 0; CORE.sortTrack(a.tracks[track]); }
     else if (f === 'a' || f === 'b') e[f] = parseFloat(el.value) || 0;
-    else if (f === 'ax' || f === 'ay') e[f] = parseFloat(el.value) || 0;
+    else if (f === 'ax' || f === 'ay') {
+      e[f] = parseFloat(el.value) || 0;
+      // ★ 缩放锚点 width/height 成对写：官方 scaleEvents 每个关键帧只有一个 anchor，
+      //   而 anchorDisp 的缩放链只重放 width 事件 —— 只改 height 会变成"改了不生效"。
+      CORE.setScaleAnchorPair(a, track, e, e.ax, e.ay);
+    }
     else if (f === 'easing') e.easing = parseInt(el.value, 10) || 1;
     else if (f === 'boolval') { e.a = el.checked; e.b = el.checked; }
     // ★ 改了事件值 → 事件成为唯一真值：必须清掉预览框覆盖 S.now，
@@ -5345,9 +5431,13 @@ $('props').addEventListener('click', ev => {
       CORE.setRectAnchor(a, 0, 0);
       status('相对支点已设为矩形中心 (0.5, 0.5)（位移 d ≡ 0）', 3000);
     } else {
-      const cur = CORE.localStateOf(a, tBeat, S.aspect);   // ★ 局部中心（父线不能重复复合）
-      writeAnchorNow(tBeat, cur.centerX, cur.centerY);
-      status('锚点 = 此刻的中心（世界固定点）：这一段此后绕它公转；要"原地自转"请用「= 自身中心」', 4500);
+      // ★★ 实际转动中心 = M + a（不是 anchor）：要把转动中心钉在"此刻的方块中心"
+      //    C0 = M + d，必须 a = d ⇒ anchor = 基准中心 + d。
+      //    旧写法 anchor = C0 会让转动中心变成 M + (C0 − 基准中心) = C0 + (M − 基准中心)，
+      //    方块离开初始位置后偏得很远（实测 M=500、基准中心=0 时转动中心落在 1000）。
+      const d0 = CORE.anchorDisp(a, tBeat, S.aspect);
+      writeAnchorNow(tBeat, (a.bx || 0) + d0.x, (a.by || 0) + d0.y);
+      status('已把【实际转动中心】钉在此刻的方块中心（anchor = 基准中心 + d）：这一段此后绕它公转', 4500);
     }
     S.rev++; renderAll();
   } else if (act === 'baseNow' || act === 'baseInit') {
@@ -5390,11 +5480,14 @@ $('props').addEventListener('click', ev => {
       status('相对支点是【整块一个值】：已设为矩形中心 (0.5, 0.5)', 3000);
     } else if (act === 'evPivotSelf') {
       ev.ax = a.bx || 0; ev.ay = a.by || 0;
+      CORE.setScaleAnchorPair(a, track, ev, ev.ax, ev.ay);   // 缩放锚点 width/height 成对
       status(`「${CORE.TRACK_BY_KEY[track].label} #${idx}」的锚点 = 基准中心 ⇒ 这一段只自转`, 3500);
     } else {
-      const cur = CORE.localStateOf(a, tBeat, S.aspect);
-      ev.ax = cur.centerX; ev.ay = cur.centerY;
-      status(`「${CORE.TRACK_BY_KEY[track].label} #${idx}」的锚点 = 此刻的中心（世界固定点）`, 3500);
+      // 与「= 当前中心（钉住）」同一套：a = d ⇒ 转动中心 M + a = 此刻的方块中心
+      const d0 = CORE.anchorDisp(a, tBeat, S.aspect);
+      ev.ax = (a.bx || 0) + d0.x; ev.ay = (a.by || 0) + d0.y;
+      CORE.setScaleAnchorPair(a, track, ev, ev.ax, ev.ay);   // 缩放锚点 width/height 成对
+      status(`「${CORE.TRACK_BY_KEY[track].label} #${idx}」的锚点已钉在此刻的转动中心`, 3500);
     }
     S.rev++; renderAll();
   } else if (act === 'syncAnchor') {
@@ -5410,6 +5503,7 @@ $('props').addEventListener('click', ev => {
       const ev = tk ? (a.tracks[tk] || [])[S.selEvent.idx] : null;
       if (ev) {
         ev.ax = an.x; ev.ay = an.y;
+        CORE.setScaleAnchorPair(a, tk, ev, ev.ax, ev.ay);   // 缩放锚点 width/height 成对
         status(`已把锚点写入「${CORE.TRACK_BY_KEY[tk].label} #${S.selEvent.idx}」`, 3000);
       } else {
         writeAnchorNow(tBeat, an.x, an.y);
