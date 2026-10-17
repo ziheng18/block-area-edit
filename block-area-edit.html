@@ -1907,8 +1907,21 @@ function fromNextBlockAreas(list, bpm) {
       out.push(o);
     }
     out.sort((p, q) => p.start - q.start);
-    if (!out.length && lifeEnd > lifeStart + NEXT_EPS) out.push({ start: lifeStart, end: lifeEnd, a: def, b: def, easing: 1 });
-    return out;
+    // ★ Next 轨的求值语义：第一个事件之前 = fallback；两个事件之间 = 保持上一个事件终值。
+    //   内部轨（evalNum）默认值/空档保持规则相同，必须把 fallback 段和空档补出来，
+    //   否则从 next 导入后窗口前段会落到内部默认值（宽 1350 / 中心 0）。
+    const filled = [];
+    let t = lifeStart, v = def;
+    const EPS = NEXT_EPS;
+    for (const e of out) {
+      const s = Math.max(lifeStart, e.start), en = Math.min(lifeEnd, e.end);
+      if (!(en > s + EPS)) continue;
+      if (s > t + EPS) filled.push({ start: t, end: s, a: v, b: v, easing: 1 });
+      filled.push(Object.assign({}, e, { start: s, end: en }));
+      t = en; v = e.b;
+    }
+    if (lifeEnd > t + EPS) filled.push({ start: t, end: lifeEnd, a: v, b: v, easing: 1 });
+    return filled;
   };
   return (list || []).filter(isNextBlockEntry).map(a => {
     const bl = a.bottomLeft || { x: 0, y: 0 }, tr = a.topRight || { x: 1, y: 1 };
@@ -1989,24 +2002,94 @@ function nextBlockAreas(areas, bpm, chartEnd, aspect) {
   };
   const mkSegs = (a, t0, t1, pick, base, anchor) => {
     const T = (a && a.tracks) || a || {};
-    const ts = [t0, t1];
+    const raw = [t0, t1];
     for (const K of ['centerX', 'centerY', 'width', 'height', 'rotation']) for (const e of (T[K] || [])) {
-      if (e.start > t0 + 1e-9 && e.start < t1 - 1e-9) ts.push(e.start);
-      if (e.end > t0 + 1e-9 && e.end < t1 - 1e-9) ts.push(e.end);
+      if (e.start > t0 + 1e-9 && e.start < t1 - 1e-9) raw.push(e.start);
+      if (e.end > t0 + 1e-9 && e.end < t1 - 1e-9) raw.push(e.end);
     }
-    const uniq = [...new Set(ts.map(t => +t.toFixed(9)))].sort((x, y) => x - y);
+    raw.sort((x, y) => x - y);
+    // 只在【这一段真的含有曲线/偏心锚点旋转】时细分；不是整块有曲线就所有段都 ×8
+    const denseFor = (s, e) => {
+      for (const K of ['centerX', 'centerY', 'width', 'height', 'rotation']) {
+        for (const ev of (T[K] || [])) {
+          if (!(ev.end > s + 1e-9 && ev.start < e - 1e-9)) continue;
+          const ez = +ev.easing;
+          if (ez && ez !== 1 && ez !== 30 && ez !== 31) return 8;
+          if (K === 'rotation' && (Math.abs(+ev.ax || 0) > 1e-9 || Math.abs(+ev.ay || 0) > 1e-9) &&
+              Math.abs((+ev.a || 0) - (+ev.b || 0)) > 1e-9) return 8;
+        }
+      }
+      return 1;
+    };
+    const uniq = [];
+    for (let i = 0; i + 1 < raw.length; i++) {
+      const s = raw[i], e = raw[i + 1];
+      if (!(e > s + 1e-9)) continue;
+      const dense = denseFor(s, e);
+      for (let k = 0; k < dense; k++) uniq.push(s + (e - s) * k / dense);
+    }
+    uniq.push(raw[raw.length - 1]);
+    const ts = [...new Set(uniq.map(t => +t.toFixed(9)))].sort((x, y) => x - y);
     const segs = [];
-    for (let i = 0; i + 1 < uniq.length; i++) {
-      const s = uniq[i], e = uniq[i + 1];
+    let emitted = false;
+    for (let i = 0; i + 1 < ts.length; i++) {
+      const s = ts[i], e = ts[i + 1];
       if (!(e > s + 1e-9)) continue;
       const sr = areaState(a, s + NEXT_EPS, A, null);
       const el = areaState(a, e - NEXT_EPS, A, null);
       const v0 = pick(sr), v1 = pick(el);
       if (!isFinite(v0) || !isFinite(v1)) continue;
-      if (Math.abs(v0 - base) < 1e-9 && Math.abs(v1 - base) < 1e-9) continue;
+      const atBase = Math.abs(v0 - base) < 1e-9 && Math.abs(v1 - base) < 1e-9;
+      // 首个非 base 段之前可以省略（next 的 fallback 就是 base）；
+      // 一旦出现过非 base 段，后面回到 base 也必须写出来，否则读端会一直保持旧值。
+      if (!emitted && atBase) continue;
+      emitted = true;
       segs.push(mkEv(s, e, v0, v1, anchor));
     }
-    return segs;
+    // 常值段压缩：next 事件同样是“段内线性 + 段后保持终值”，所以一段值不变时
+    // 只需在段首写一条 ≤1/4 拍事件（与 RPE 轨规范化规则一致），不必铺满整段。
+    const out = [];
+    let i = 0;
+    while (i < segs.length) {
+      const ev = segs[i];
+      const st = tripleToBeats(ev.startTime), en = tripleToBeats(ev.endTime);
+      // ★ 常值判定看【值】不是看时长：v0==v1 的段即使跨很长时间也只是保持值
+      if (Math.abs(ev.start - ev.end) > 1e-9) { out.push(ev); i++; continue; }
+      const v = ev.start;
+      let runEnd = en;
+      let j = i + 1;
+      while (j < segs.length) {
+        const ne = segs[j];
+        const ns = tripleToBeats(ne.startTime), nen = tripleToBeats(ne.endTime);
+        if (Math.abs(ne.start - ne.end) > 1e-9 || Math.abs(ne.start - v) > 1e-9) break;
+        if (ns > runEnd + 1e-9) break;
+        runEnd = Math.max(runEnd, nen); j++;
+      }
+      const nextStart = (j < segs.length) ? tripleToBeats(segs[j].startTime) : runEnd;
+      let dur = Math.min(1 / 4, runEnd - st);
+      if (isFinite(nextStart)) dur = Math.min(dur, nextStart - st);
+      if (!(dur > 1e-9)) dur = 1 / 480;
+      out.push(mkEv(st, st + Math.max(1 / 480, dur), v, v, anchor));
+      i = j;
+    }
+    // 最终兜底：按时间排序并消掉亚 tick 精度造成的重叠（外部校验器对重叠是硬错误）。
+    const sorted = out.slice().sort((x, y) => tripleToBeats(x.startTime) - tripleToBeats(y.startTime));
+    const clean = [];
+    for (let e of sorted) {
+      let s = tripleToBeats(e.startTime), en = tripleToBeats(e.endTime);
+      if (!(en > s + 1e-9)) continue;
+      const last = clean[clean.length - 1];
+      if (last) {
+        const le = tripleToBeats(last.endTime);
+        if (s < le - 1e-9) {
+          s = le;
+          if (!(en > s + 1e-9)) continue;
+          e = Object.assign({}, e, { startTime: beatTriple(s) });
+        }
+      }
+      clean.push(e);
+    }
+    return clean;
   };
   for (const a of (areas || [])) {
     const T = (a && a.tracks) || a || {};
