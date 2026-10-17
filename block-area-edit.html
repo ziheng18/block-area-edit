@@ -2267,11 +2267,21 @@ function encScale(v) {
  *  ★ 只有 **visible** 决定"出现/消失"；active 只决定"激活/失活"（且只在可见时生效）。
  *    原因：官方 blockArea 的 enable 区间是"生效"而不是"出现"，可以比 appear 早/晚；
  *    旧实现把 active∪visible 当出现 → 会出现"第一次出现就被写成 4(消失)"（用户实测）。
- *  ★ 出现时先补一条 1（出现），再在同刻写 2（激活）——1 放在出现前 1e-4 拍，
- *    保证 RPE Recorder 能把这次出现正常标记出来（2 直接打头时它可能只当作激活动画）。
+ *  ★ 时间统一量化到 1/480 拍网格：三元组分母恒为 480（0 拍写 [0,0,1]）。
+ *    这样不会出现 0.1249 被 bestTriple 表示成 230400 分母的"插值片"，
+ *    也不会让 1/2 两个事件因分母不同被读取器排序错（RPE Recorder 对时间/事件顺序敏感）。
+ *  ★ 出现时先写 1（出现）再写 2（激活）：1 放在出现前 1/480 拍（一个 tick），
+ *    若前一个事件太近放不下就退化为只写 2（真实谱也常省略 1）。
  *  多周期逐段写；首个事件晚于 0 拍时补 10（初始化）。 */
 function lifeToSpeedEvents(T, chartEnd) {
+  const QD = 480;                                  // 生命周期时间统一网格（1/480 拍）
+  const tick = 1 / QD;
+  const qt = (t) => Math.round(Math.max(0, +t || 0) * QD) / QD;
+  const lifeTriple = (t) => { const q = qt(t); return q === 0 ? [0, 0, 1] : beatsToTriple(q, QD); };
   const addTimes = (out, track) => {
+    // ★ 用【原始时间】求值，只在记录变化时量化：
+    //   先量化再求值会让 0.1250000057 这类事件起点被量化到 0.125（比真实起点早 5e-9），
+    //   evalBool 在 0.125 处仍判定"未出现"，整条线的第一个 1/2 会被推迟到下一个窗口（实测）。
     for (const e of (track || [])) for (const t of [e.start, e.end]) if (isFinite(t)) out.push(+Math.max(0, t).toFixed(9));
   };
   const ts = [];
@@ -2282,28 +2292,23 @@ function lifeToSpeedEvents(T, chartEnd) {
   let curV = false, curA = false;
   for (let i = 0; i < times.length; i++) {
     const t = times[i];
+    const T0 = qt(t);
     const v = evalBool(T.visible, t, false), a = evalBool(T.active, t, false);
     if (v !== curV) {
       if (v) {
-        let t1 = t;
-        if (t > 1e-9) {
-          const prevT = changes.length ? changes[changes.length - 1].t : 0;
-          const nextT = (i + 1 < times.length) ? times[i + 1] : t + 1;
-          const eps = Math.min(1e-4, Math.max(1e-6, (t - Math.max(0, prevT)) / 4),
-                               Math.max(1e-6, (nextT - t) / 4));
-          t1 = Math.max(0, t - eps);
-        }
-        changes.push({ t: t1, v: 1 });          // 出现
-        if (a) changes.push({ t, v: 2 });       // 同刻激活
+        const prevT = changes.length ? changes[changes.length - 1].t : -1;
+        if (T0 > 1e-9 && T0 - tick > prevT + 1e-9) changes.push({ t: T0 - tick, v: 1 });   // 出现
+        if (a) changes.push({ t: T0, v: 2 });                                            // 同刻激活
+        else if (!changes.length || changes[changes.length - 1].v !== 1) changes.push({ t: T0, v: 1 });
       } else {
-        changes.push({ t, v: 4 });              // 消失
+        changes.push({ t: T0, v: 4 });              // 消失
       }
     } else if (v && a !== curA) {
-      changes.push({ t, v: a ? 2 : 3 });        // 可见前提下的激活 / 失活
+      changes.push({ t: T0, v: a ? 2 : 3 });        // 可见前提下的激活 / 失活
     }
     curV = v; curA = a;
   }
-  // 同刻只保留最后一个值（出现+激活在 t=0 时合并为 2；t>0 时两者已用 eps 分开）
+  // 同刻只保留最后一个值（t=0 出现+激活合并为 2；t>0 时两者相隔一个 tick）
   const dedup = [];
   for (const c of changes) {
     const last = dedup[dedup.length - 1];
@@ -2316,9 +2321,14 @@ function lifeToSpeedEvents(T, chartEnd) {
   for (let i = 0; i < dedup.length; i++) {
     const t0 = dedup[i].t;
     let t1 = (i + 1 < dedup.length) ? dedup[i + 1].t
-           : (isFinite(chartEnd) && chartEnd > t0 + 1e-9 ? chartEnd : t0 + 1);
-    if (!(t1 > t0)) t1 = t0 + 1e-4;
-    out.push(mkRpeEv(t0, t1, dedup[i].v, dedup[i].v, 1));
+           : (isFinite(chartEnd) && chartEnd > t0 + 1e-9 ? qt(chartEnd) : t0 + tick);
+    if (!(t1 > t0)) t1 = t0 + tick;
+    out.push({
+      startTime: lifeTriple(t0), endTime: lifeTriple(t1),
+      start: dedup[i].v, end: dedup[i].v,
+      easingType: 1, bezier: 0, bezierPoints: [0, 0, 0, 0],
+      easingLeft: 0, easingRight: 1, linkgroup: 0,
+    });
   }
   return out;
 }
@@ -4246,7 +4256,7 @@ const CORE = {
   lineStateAt,
   pezInfoTxt,
   recorderSubtractOf, recorderLifeCycle, recorderLineToArea, areaToRecorderLine, rpeWithNoiseLines,
- packNoiseAreas, packLowerBound, areaSpans, rpeFromOfficial, HEIGHT_RATIO, SPEED_RATIO_RPE, FADEOUT_TIME, ABOVE_SIGN, NOTE_WIDTH_RATIO_BASE, NOTE_W_RPE, kRpePerBeat, lineEvents, buildLines, buildFloor, floorAt,
+ packNoiseAreas, packLowerBound, areaSpans, rpeFromOfficial, lifeToSpeedEvents, HEIGHT_RATIO, SPEED_RATIO_RPE, FADEOUT_TIME, ABOVE_SIGN, NOTE_WIDTH_RATIO_BASE, NOTE_W_RPE, kRpePerBeat, lineEvents, buildLines, buildFloor, floorAt,
   kRpeFactor, isMultiBpm, bpmAt, floorTimeBetween,
 };
 /* ============================================================================
