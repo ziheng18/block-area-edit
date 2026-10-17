@@ -57,6 +57,7 @@
 - **适配 RPE Recorder**：把「**仅导出噪域数据**」得到的 json 放进 **RPE Recorder 的 `file` 文件夹**即可读取。
 - **官方噪域格式：导入 / 导出双向兼容** —— 可读入官方谱面里已有的 `blockAreaList` 继续编辑。
 - **RPE Next（`RPEVersion >= 220`）噪域格式**：支持 `bottomLeft`/`topRight` + `moveXEvents/...` 的 next schema 导入；
+  RPE Next 噪域导入时旋转角会按屏幕方向取负；RPE Next 没有颜色通道，含彩色噪域时导出会先弹专用警告，确认后剥离颜色再导出。
   所有导出 RPE 的路径都会写 next schema（避免新版 RPE/Next 加载器把 native 条目当 next 读、
   报 `blockAreaList[0].bottomLeft 坐标必须包含有限 x/y`）。
 - **官方格式「变格功能」警告**：谱面含官方格式无法表达且无法拟合的功能（彩色噪域颜色、噪域载体线音符等）时，
