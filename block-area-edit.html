@@ -2264,32 +2264,61 @@ function encScale(v) {
 }
 
 /** visible/active 布尔轨 → 速度道生命周期事件（1 出现 / 2 激活 / 3 失活 / 4 消失）。
- *  多次开关逐段写；首个变化晚于 0 拍时补 10（初始化）。返回的顺序即时间顺序。 */
+ *  ★ 只有 **visible** 决定"出现/消失"；active 只决定"激活/失活"（且只在可见时生效）。
+ *    原因：官方 blockArea 的 enable 区间是"生效"而不是"出现"，可以比 appear 早/晚；
+ *    旧实现把 active∪visible 当出现 → 会出现"第一次出现就被写成 4(消失)"（用户实测）。
+ *  ★ 出现时先补一条 1（出现），再在同刻写 2（激活）——1 放在出现前 1e-4 拍，
+ *    保证 RPE Recorder 能把这次出现正常标记出来（2 直接打头时它可能只当作激活动画）。
+ *  多周期逐段写；首个事件晚于 0 拍时补 10（初始化）。 */
 function lifeToSpeedEvents(T, chartEnd) {
-  const ts = new Set();
-  for (const e of (T.visible || [])) for (const t of [e.start, e.end]) if (isFinite(t)) ts.add(+Math.max(0, t).toFixed(9));
-  for (const e of (T.active || [])) for (const t of [e.start, e.end]) if (isFinite(t)) ts.add(+Math.max(0, t).toFixed(9));
-  if (!ts.size) return [];
-  const times = [...ts].sort((x, y) => x - y);
+  const addTimes = (out, track) => {
+    for (const e of (track || [])) for (const t of [e.start, e.end]) if (isFinite(t)) out.push(+Math.max(0, t).toFixed(9));
+  };
+  const ts = [];
+  addTimes(ts, T.visible); addTimes(ts, T.active);
+  const times = [...new Set(ts)].sort((x, y) => x - y);
+  if (!times.length) return [];
   const changes = [];
   let curV = false, curA = false;
-  for (const t of times) {
+  for (let i = 0; i < times.length; i++) {
+    const t = times[i];
     const v = evalBool(T.visible, t, false), a = evalBool(T.active, t, false);
-    if (v === curV && a === curA) continue;
-    // 状态迁移 → 约定取值（2 同时隐含"已出现"；4 同时隐含"已失活"）
-    const val = !v ? 4 : (a ? 2 : (curA ? 3 : 1));
-    changes.push({ t, v: val });
+    if (v !== curV) {
+      if (v) {
+        let t1 = t;
+        if (t > 1e-9) {
+          const prevT = changes.length ? changes[changes.length - 1].t : 0;
+          const nextT = (i + 1 < times.length) ? times[i + 1] : t + 1;
+          const eps = Math.min(1e-4, Math.max(1e-6, (t - Math.max(0, prevT)) / 4),
+                               Math.max(1e-6, (nextT - t) / 4));
+          t1 = Math.max(0, t - eps);
+        }
+        changes.push({ t: t1, v: 1 });          // 出现
+        if (a) changes.push({ t, v: 2 });       // 同刻激活
+      } else {
+        changes.push({ t, v: 4 });              // 消失
+      }
+    } else if (v && a !== curA) {
+      changes.push({ t, v: a ? 2 : 3 });        // 可见前提下的激活 / 失活
+    }
     curV = v; curA = a;
   }
-  if (!changes.length) return [];
-  if (changes[0].t > 1e-9) changes.unshift({ t: 0, v: 10 });      // 0 拍初始化
+  // 同刻只保留最后一个值（出现+激活在 t=0 时合并为 2；t>0 时两者已用 eps 分开）
+  const dedup = [];
+  for (const c of changes) {
+    const last = dedup[dedup.length - 1];
+    if (last && Math.abs(last.t - c.t) < 1e-9) last.v = c.v;
+    else dedup.push({ t: c.t, v: c.v });
+  }
+  if (!dedup.length) return [];
+  if (dedup[0].t > 1e-9) dedup.unshift({ t: 0, v: 10 });      // 0 拍初始化
   const out = [];
-  for (let i = 0; i < changes.length; i++) {
-    const t0 = changes[i].t;
-    let t1 = (i + 1 < changes.length) ? changes[i + 1].t
+  for (let i = 0; i < dedup.length; i++) {
+    const t0 = dedup[i].t;
+    let t1 = (i + 1 < dedup.length) ? dedup[i + 1].t
            : (isFinite(chartEnd) && chartEnd > t0 + 1e-9 ? chartEnd : t0 + 1);
-    if (!(t1 > t0)) t1 = t0 + 1;
-    out.push(mkRpeEv(t0, t1, changes[i].v, changes[i].v, 1));
+    if (!(t1 > t0)) t1 = t0 + 1e-4;
+    out.push(mkRpeEv(t0, t1, dedup[i].v, dedup[i].v, 1));
   }
   return out;
 }
@@ -3167,11 +3196,17 @@ function rpeFromOfficial(doc, opts) {
   const mkNotes = (list, above) => (list || []).map(n => {
     const t0 = clampB((+n.time || 0) * T2B);
     const t1 = clampB(((+n.time || 0) + (+n.holdTime || 0)) * T2B);
+    const kindO = n.type | 0;
     return {
       startTime: tri(t0), endTime: tri(t1),
       positionX: (+n.positionX || 0) * X2RPE,
-      above: above ? 1 : 0, type: O2R[n.type | 0] || 1,
-      speed: (n.speed == null ? 1 : +n.speed), size: 1, yOffset: 0,
+      above: above ? 1 : 0, type: O2R[kindO] || 1,
+      // ★ Phira 的官方谱解析器对 Hold（官方 type=3）**强制 speed=1**，官方文件里的
+      //   note.speed 是脏值（实测 2.3 / 35 / 100 / 500 都有）；RPE 播放器会真的把
+      //   note.speed 乘进长条流速 → 原样抄过去会让长条"流速过快"（用户实测）。
+      //   所以 Hold 写 1；其他类型官方解析器就是用文件里的 speed，原样保留。
+      speed: kindO === 3 ? 1 : (n.speed == null ? 1 : +n.speed),
+      size: 1, yOffset: 0,
       isFake: 0, alpha: 255, visibleTime: 999999,
     };
   });
@@ -4051,7 +4086,9 @@ function buildLines(doc, format) {
           t: n.time * T2B, te: (n.time + (n.holdTime || 0)) * T2B,
           tSec: n.time * (60 / 32 / (L.bpm || 180)), teSec: (n.time + (n.holdTime || 0)) * (60 / 32 / (L.bpm || 180)),
           x: (n.positionX || 0) * X2RPE, above, type: n.type | 0,
-          speed: n.speed || 1, size: 1, yOffset: 0, fake: false, alpha: 1,
+          // ★ 官方 Hold（type=3）的 note.speed 是脏值（实测 2.3/35/100/500）；Phira 的
+          //   pgr.rs 对 Hold 强制 speed=1，编辑器预览也必须同口径，否则长条流速会偏快。
+          speed: (n.type | 0) === 3 ? 1 : (n.speed || 1), size: 1, yOffset: 0, fake: false, alpha: 1,
         });
       out.push({
         ev: {
