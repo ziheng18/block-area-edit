@@ -72,7 +72,7 @@
   label.chk{display:inline-flex;align-items:center;gap:4px;cursor:pointer;user-select:none}
   .sep{width:1px;height:18px;background:var(--line2);margin:0 4px}
   .mono{font-family:Consolas,"Cascadia Mono",monospace}
-  main{display:grid;grid-template-columns:200px 1fr 252px 320px;min-height:0}
+  main{display:grid;grid-template-columns:200px 1fr 286px 320px;min-height:0}
   /* 预览框暂时停用：JS 里 SHOW_STAGE = false。恢复时把该常量改回 true 即可，样式无需改动。 */
   body.no-stage main{grid-template-columns:200px minmax(320px,1fr) 320px}
   body.no-stage #stageWrap{display:none}
@@ -1871,9 +1871,10 @@ function toJson(areas, den) {
         if (t.colorTrack) return {
           startTime: T(e.start), endTime: T(e.end),
           start: colorFromAny(e.a).slice(), end: colorFromAny(e.b).slice(),
-          easingType: e.easing || 1,
+          easingType: e.easing || 1, lockAB: !!e.lockAB,
         };
         const o = { startTime: T(e.start), endTime: T(e.end), start: e.a, end: e.b, easingType: e.easing || 1 };
+        if (e.lockAB) o.lockAB = true;
         if (e.ax != null) {
           if (isRect) {
             // ★ 规范里 anchorFollowsRect=true 时 anchor 是【矩形自身的归一化支点 [0,1]】，
@@ -1903,8 +1904,10 @@ function parseAreas(raw, bpm) {
           if (t.colorTrack) return {
             start: tripleToBeats(e.startTime), end: tripleToBeats(e.endTime),
             a: colorFromAny(e.start), b: colorFromAny(e.end), easing: e.easingType || 1,
+            lockAB: !!e.lockAB,
           };
           const o = { start: tripleToBeats(e.startTime), end: tripleToBeats(e.endTime), a: +e.start || 0, b: +e.end || 0, easing: e.easingType || 1 };
+          if (e.lockAB) o.lockAB = true;
           if (e.anchorX != null) { o.ax = e.anchorX; o.ay = e.anchorY == null ? 0 : e.anchorY; }
           return o;
         });
@@ -5553,7 +5556,13 @@ function lowerBound(arr, key) {
 
 /* ------------------------------ 渲染：竖直时间轴 ------------------------------ */
 
-const RULER_W = 46, COL_W = 28;
+const RULER_W = 46;
+// ★ 事件列宽按可用宽度自适应：8 列（含颜色）必须全部放进 286px 面板，
+//   否则最右侧「生效」列会被裁掉（用户实测）。保持 18~28px 的可用范围。
+let COL_W = 28;
+function tlColW(w) {
+  return Math.max(18, Math.min(28, Math.floor((w - RULER_W) / Math.max(1, CORE.TRACKS.length))));
+}
 
 function tlGeom() {
   const h = tl.clientHeight, w = tl.clientWidth;
@@ -5624,7 +5633,7 @@ function copySelEvents() {
     track, d0: e.start - t0, d1: e.end - t0,
     a: (CORE.TRACK_BY_KEY[track] && CORE.TRACK_BY_KEY[track].colorTrack) ? CORE.colorCopy(e.a) : e.a,
     b: (CORE.TRACK_BY_KEY[track] && CORE.TRACK_BY_KEY[track].colorTrack) ? CORE.colorCopy(e.b) : e.b,
-    easing: e.easing, ax: e.ax, ay: e.ay })) };
+    easing: e.easing, ax: e.ax, ay: e.ay, lockAB: !!e.lockAB })) };
   return items.length;
 }
 /** 在播放头处粘贴剪贴板里的事件（保留相对偏移与轨道） */
@@ -5639,7 +5648,8 @@ function pasteClipEvents() {
     const s = Math.max(0, base + it.d0), e2 = Math.max(0, base + it.d1);
     const isC = !!(CORE.TRACK_BY_KEY[it.track] && CORE.TRACK_BY_KEY[it.track].colorTrack);
     const rec = { start: s, end: Math.max(s + 1e-6, e2),
-      a: isC ? CORE.colorCopy(it.a) : it.a, b: isC ? CORE.colorCopy(it.b) : it.b, easing: it.easing || 1 };
+      a: isC ? CORE.colorCopy(it.a) : it.a, b: isC ? CORE.colorCopy(it.b) : it.b, easing: it.easing || 1,
+      lockAB: !!it.lockAB };
     if (it.ax != null) { rec.ax = it.ax; rec.ay = it.ay == null ? 0 : it.ay; }
     arr.push(rec);
     CORE.sortTrack(arr);
@@ -5680,7 +5690,8 @@ function cloneSelToAreas(targets, offsetBeats) {
       const s = Math.max(0, it.e.start + off), en = Math.max(0, it.e.end + off);
       const isC = !!(CORE.TRACK_BY_KEY[it.track] && CORE.TRACK_BY_KEY[it.track].colorTrack);
       const rec = { start: s, end: Math.max(s + 1e-6, en),
-        a: isC ? CORE.colorCopy(it.e.a) : it.e.a, b: isC ? CORE.colorCopy(it.e.b) : it.e.b, easing: it.e.easing || 1 };
+        a: isC ? CORE.colorCopy(it.e.a) : it.e.a, b: isC ? CORE.colorCopy(it.e.b) : it.e.b,
+        easing: it.e.easing || 1, lockAB: !!it.e.lockAB };
       if (it.e.ax != null) { rec.ax = it.e.ax; rec.ay = it.e.ay == null ? 0 : it.e.ay; }
       arr.push(rec);
       CORE.sortTrack(arr);
@@ -5695,6 +5706,7 @@ function cloneSelToAreas(targets, offsetBeats) {
 
 function renderTimeline() {
   const { w, h } = fit(tl, tctx);
+  COL_W = tlColW(w);               // ★ 自适应列宽：保证最右侧列完整可见
   S.tlH = h;                       // ★ 纵向映射依赖视口高度（beatToY/yToBeat）
   tctx.clearRect(0, 0, w, h);
   tctx.fillStyle = '#12151b'; tctx.fillRect(0, 0, w, h);
@@ -5712,7 +5724,8 @@ function renderTimeline() {
     tctx.strokeStyle = '#252a35';
     tctx.beginPath(); tctx.moveTo(x + .5, HEAD); tctx.lineTo(x + .5, h); tctx.stroke();
     tctx.fillStyle = t.color; tctx.font = '10px "Microsoft YaHei",sans-serif'; tctx.textAlign = 'center';
-    tctx.fillText(t.label, x + COL_W / 2, 14);
+    // 列宽不足时用短标签（X / 宽 / 色 / 现 / 效），否则完整标签会互相压住
+    tctx.fillText(COL_W < 26 ? t.short : t.label, x + COL_W / 2, 14);
   }
   tctx.strokeStyle = '#252a35';
   tctx.beginPath(); tctx.moveTo(RULER_W + CORE.TRACKS.length * COL_W + .5, HEAD); tctx.lineTo(RULER_W + CORE.TRACKS.length * COL_W + .5, h); tctx.stroke();
@@ -5798,8 +5811,15 @@ function renderTimeline() {
         const shave = isLastEv ? 0 : 1;
         const top2 = top + shave;
         const drawH = Math.max(1, bot - top2);
-        tctx.fillStyle = t.bool ? (e.a ? t.color : '#3a4050')
-          : (t.colorTrack ? CORE.colorCss(e.a, 1) : t.color);
+        if (t.colorTrack) {
+          // ★ 颜色事件条 = 起止颜色渐变（下 = 起始色，上 = 终止色；时间轴向上为后）
+          const g = tctx.createLinearGradient(0, bot, 0, top2);
+          g.addColorStop(0, CORE.colorCss(e.a, 1));
+          g.addColorStop(1, CORE.colorCss(e.b, 1));
+          tctx.fillStyle = g;
+        } else {
+          tctx.fillStyle = t.bool ? (e.a ? t.color : '#3a4050') : t.color;
+        }
         tctx.globalAlpha = selected ? 1 : 0.62;
         tctx.fillRect(x, top2, cw, drawH);
         tctx.globalAlpha = 1;
@@ -6226,10 +6246,12 @@ function renderProps() {
               <span class="mono" style="font-size:11px;color:var(--dim)">${CORE.colorHex(e.a)}</span></div>
             <div class="f"><span>终止颜色</span><input type="color" data-ev="colorB" value="${CORE.colorHex(e.b)}">
               <span class="mono" style="font-size:11px;color:var(--dim)">${CORE.colorHex(e.b)}</span></div>
+            <div class="f"><span>起止钩定</span><label class="chk"><input type="checkbox" data-ev="lockAB" ${e.lockAB ? 'checked' : ''}> 钩定（起始颜色 = 终止颜色）</label></div>
             <div class="empty" style="padding:0">颜色事件写进 RPE 的 <b>extended.colorEvents</b>；默认色 = 255,84,84。</div>`;
         } else {
           html += `<div class="f"><span>起始值</span><input type="number" data-ev="a" value="${rnd(e.a, 3)}"><button class="mini" data-sync="${track}" data-syncfield="a" title="把预览当前值写入【起始值】">⟲</button></div>
-            <div class="f"><span>终止值</span><input type="number" data-ev="b" value="${rnd(e.b, 3)}"><button class="mini" data-sync="${track}" data-syncfield="b" title="把预览当前值写入【终止值】">⟲</button></div>`;
+            <div class="f"><span>终止值</span><input type="number" data-ev="b" value="${rnd(e.b, 3)}"><button class="mini" data-sync="${track}" data-syncfield="b" title="把预览当前值写入【终止值】">⟲</button></div>
+            <div class="f"><span>起止钩定</span><label class="chk"><input type="checkbox" data-ev="lockAB" ${e.lockAB ? 'checked' : ''}> 钩定（起始值 = 终止值）</label></div>`;
         }
         html += `<div class="f"><span>缓动 id</span>
             <input type="number" id="easeId" min="1" max="31" step="1" value="${e.easing | 0}">
@@ -6796,11 +6818,34 @@ $('props').addEventListener('input', ev => {
     if (!e) return;
     const f = el.dataset.ev;
     if (f === 'start' || f === 'end') { e[f] = parseFloat(el.value) || 0; CORE.sortTrack(a.tracks[track]); }
-    else if (f === 'a' || f === 'b') e[f] = parseFloat(el.value) || 0;
+    else if (f === 'a' || f === 'b') {
+      const v = parseFloat(el.value) || 0;
+      if (e.lockAB) {                    // 钩定：起始值 = 终止值
+        e.a = v; e.b = v;
+        const other = el.parentElement && el.parentElement.parentElement && el.parentElement.parentElement.querySelector
+          ? el.parentElement.parentElement.querySelector('input[data-ev="' + (f === 'a' ? 'b' : 'a') + '"]') : null;
+        if (other) other.value = String(v);
+      } else e[f] = v;
+    }
+    else if (f === 'lockAB') {
+      e.lockAB = !!el.checked;
+      if (e.lockAB) {
+        if (track === 'color') e.b = CORE.colorCopy(e.a);
+        else e.b = e.a;
+      }
+      S.now = null; S.rev++;
+      renderStage(); renderTimeline(); renderProps();
+      return;
+    }
     else if (f === 'colorA' || f === 'colorB') {
       const c = CORE.colorFromHex(el.value);
-      if (c) e[f === 'colorA' ? 'a' : 'b'] = c;
-      else return;
+      if (!c) return;
+      if (e.lockAB) {                    // 钩定：起始颜色 = 终止颜色
+        e.a = CORE.colorCopy(c); e.b = CORE.colorCopy(c);
+        const other = el.parentElement && el.parentElement.parentElement && el.parentElement.parentElement.querySelector
+          ? el.parentElement.parentElement.querySelector('input[data-ev="' + (f === 'colorA' ? 'colorB' : 'colorA') + '"]') : null;
+        if (other) other.value = CORE.colorHex(c);
+      } else e[f === 'colorA' ? 'a' : 'b'] = c;
     }
     else if (f === 'ax' || f === 'ay') {
       e[f] = parseFloat(el.value) || 0;
@@ -6862,7 +6907,8 @@ $('props').addEventListener('click', ev => {
       return status('这个 ⟲ 属于「' + (CORE.TRACK_BY_KEY[key] ? CORE.TRACK_BY_KEY[key].label : key) + '」轨道，请先选中该轨道的事件', 3500);
     }
     const e = a.tracks[S.selEvent.track][S.selEvent.idx];
-    e[field] = v;
+    if (e.lockAB) { e.a = v; e.b = v; }   // 钩定：写任一端都保持起止相同
+    else e[field] = v;
     // ★ 缓冲区【保留】：同一个拖动结果要能分别写进起始值和终止值，
     //   写 a 之后立刻写 b 必须还能取到值（否则 b 的 ⟲ 会提示"当前值里没有这一项"）。
     //   缓冲区的清除时机是「改事件 / 换噪域 / 撤销」等，不在这里。
@@ -7014,7 +7060,8 @@ $('props').addEventListener('click', ev => {
     const isC = !!(CORE.TRACK_BY_KEY[track] && CORE.TRACK_BY_KEY[track].colorTrack);
     const mid = isC ? CORE.evalColor(evs, tBeat, CORE.NOISE_DEFAULT_COLOR) : CORE.evalNum(evs, tBeat, 0);
     const right = { start: tBeat, end: e.end,
-      a: isC ? CORE.colorCopy(mid) : mid, b: isC ? CORE.colorCopy(e.b) : e.b, easing: e.easing };
+      a: isC ? CORE.colorCopy(mid) : mid, b: isC ? CORE.colorCopy(e.b) : e.b,
+      easing: e.easing, lockAB: !!e.lockAB };
     e.end = tBeat; e.b = isC ? CORE.colorCopy(mid) : mid;
     evs.push(right); CORE.sortTrack(evs);
     S.selEvent = { track, idx: evs.indexOf(right) };
