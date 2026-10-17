@@ -164,8 +164,8 @@
     <button id="btnBatch" title="批量编辑多个噪域（支持拖动多选）">☰ 批量编辑</button>
     <button id="btnExpAreaList" title="仅导出噪域数据：**标准官谱结构**（formatVersion/offset/judgeLineList:[]/blockAreaList），文件名 blockAreaList.json —— RPE Recorder 原生适配官谱噪域">仅导出噪域数据</button>
     <button id="btnExpRpePez" title="导出 RPE 格式 pez（含 blockAreaList，但去掉所有噪域判定线，不带噪域贴图）">导出 RPE pez（无噪域线）</button>
+  <button id="btnExpRpePezNoise" title="导出 RPE 格式 pez（含噪域判定线：Line2Area 生命周期 / 彩色噪域颜色事件 / 合并 / zOrder 遮挡都在；给 RPE Recorder / Phira Pro 用）">导出 RPE pez（含噪域线）</button>
     <button id="btnWriteDir" title="选择 RPE 谱面目录，直接写回其中的谱面 json">写回 RPE 目录</button>
-    <label class="chk" id="lblRpeLines" title="勾选后：导出 RPE / 写回 RPE 目录时，把噪域写成 Line2Area 判定线（Texture=isSubtract0/1.png、生命周期走 speed 道、anchor 为贴图归一化支点）。默认关闭。"><input type="checkbox" id="chkRpeLines"> RPE 含噪域线</label>
     <label class="chk" title="勾选后：预览拖拽/改值【立即写入事件】，不再需要点 ⟲（是否出现/是否生效不受影响）"><input type="checkbox" id="chkLive"> 即时修改</label>
     <label class="chk" id="lblImgCols" title="横向网格数，越大越细">精细度 <input type="number" id="imgCols" value="48" min="8" max="200" step="8" style="width:52px"></label>
   <span class="sep"></span>
@@ -177,7 +177,8 @@
   </label>
   <label class="chk" id="lblSnap">吸附 1/<input type="number" id="snapN" value="4" min="1" max="64" step="1"> 拍</label>
   <span class="sep"></span>
-  <label class="chk" title="开启后只画【实机真正会渲染的区域】：普通块为红、被减算块挖掉的洞不画；未生效的块用低不透明度标出。关闭时为编辑视图（普通块红 / 减算块蓝，都画轮廓）。"><input type="checkbox" id="chkMachine"> 实机贴合</label>
+  <label class="chk" title="开启后只画【实机真正会渲染的区域】，并按噪域颜色事件渲染（含不同颜色噪域的 zOrder/线号遮挡；未生效的块用低不透明度标出）。关闭时为编辑视图。"><input type="checkbox" id="chkMachine"> 实机贴合</label>
+  <label class="chk" title="编辑视图（未开实机贴合）下是否按噪域颜色事件渲染；关闭则恢复普通块红 / 减算块蓝。实机贴合始终按噪域颜色渲染。"><input type="checkbox" id="chkColorPreview" checked> 彩色噪域预览</label>
   <label class="chk" title="在判定框里、各噪域对应的位置上显示它的编号（与左侧列表 / 属性面板一致，0 起）。选中项用金色、普通块红色、减算块蓝色、未生效半透明。"><input type="checkbox" id="chkAreaIdx"> 噪域编号</label>
   <label class="chk" title="双押（同时按两个键）的音符改用皮肤包里的 _mh 贴图（Phira 的 double_hint，note.rs:210）。默认开；关掉则双押也用普通贴图、保持红/蓝原色。无贴图时会退化成"键体 + 一圈薄黄"。"><input type="checkbox" id="chkMh" checked> 双押提示</label>
   <button id="btnPlay">▶ 播放</button>
@@ -4514,7 +4515,7 @@ const S = {
   snapN: 4, pxPerBeat: 60, tlB0: 0, tlH: 0,
   pending: null,                  // {track, start, end} 等待事件尾
   now: null,                      // 预览框当前值 {centerX..}（拖拽/输入产生，未同步到事件）
-  undo: [], redo: [], rev: 0, liveEdit: false, machineTruth: false, rpeNoiseLines: false,
+  undo: [], redo: [], rev: 0, liveEdit: false, machineTruth: false, colorPreview: true,
   filter: '', onlyActive: false, showNotes: false, showAreaIdx: false, showMh: true, notes: [],
   drag: null, lastFrame: 0, tlMouse: null, listScroll: 0, tlDrag: null,
   audioManual: false,          // 音频是否由用户手动载入（手动优先于「从 RPE 目录自动挂」）
@@ -4720,7 +4721,9 @@ function makeArea(tBeat) {
   return CORE.newArea(tracks, false, 0, 0, true);
 }
 
-function buildRpeObj() {                       // 供「导出 RPE」「写回目录」「RPE pez」共用
+function buildRpeObj(opts) {                    // 供「导出 RPE」「写回目录」「RPE pez」共用
+  const withNoise = !!(opts && opts.noiseLines);
+  const keepNoise = !!(opts && opts.keepNoiseLines);
   if (!S.doc && !S.srcDoc) return null;
   const chartEnd = S.bpm.beat(S.total);
   // ★ 官方来源：S.doc 只是空壳（judgeLineList: []）→ 必须先转成 RPE 骨架
@@ -4737,9 +4740,16 @@ function buildRpeObj() {                       // 供「导出 RPE」「写回�
   }
   let obj = base;
   // ★ 可选：把当前噪域【反向写成 Line2Area 判定线】并替换谱里旧的噪域线
-  //   （S.rpeNoiseLines = 「RPE 含噪域线」开关）。写的是新对象，不改内存里的 S.doc。
-  if (S.rpeNoiseLines) {
+  //   （只有「导出 RPE pez（含噪域线）」传 opts.noiseLines=true；普通 RPE 导出不写噪域线）。
+  //   写的是新对象，不改内存里的 S.doc。
+  if (withNoise) {
     obj = CORE.rpeWithNoiseLines(base, S.lines, S.areas, { chartEnd: chartEnd, aspect: S.aspect });
+  } else if (!keepNoise) {
+    // ★ 普通 RPE 导出：把源谱里已有的 Line2Area 判定线也去掉（噪域只走 blockAreaList）。
+    //   只有「导出 RPE pez（含噪域线）」会重建 Line2Area 线；「写回目录」用 keepNoiseLines 保留源谱原有线。
+    const jll = (base.judgeLineList || []).filter(L => CORE.recorderSubtractOf(L && L.Texture) < 0);
+    if (jll.length !== (base.judgeLineList || []).length)
+      obj = Object.assign({}, base, { judgeLineList: jll });
   }
   obj = Object.assign({}, obj);
   // ★ 官方形状：RPE Recorder 读的就是它（已过官谱 14355 条往返恒等判据）
@@ -4762,7 +4772,7 @@ function exportRpe() {
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
   status(`已导出 ${S.areas.length} 个噪域`
     + (S.format !== 'rpe' ? '（官方谱已转 RPE：判定线 + 音符）' : '')
-    + (S.rpeNoiseLines ? ` → ${rpeNoiseLineCount(obj)} 条 Line2Area 判定线（时间不重叠的已合并）` : ''), 4000);
+    + '；噪域只走 blockAreaList（要含 Line2Area 判定线请用「导出 RPE pez（含噪域线）」）', 6000);
 }
 
 function computeTotal() {
@@ -5228,6 +5238,7 @@ function statesAt(tBeat) {
 const mkAct = document.createElement('canvas'), mkActx = mkAct.getContext('2d');
 const mkIna = document.createElement('canvas'), mkInaCtx = mkIna.getContext('2d');
 const mkTmp = document.createElement('canvas'), mkTmpCtx = mkTmp.getContext('2d');
+const mkCol = document.createElement('canvas'), mkColx = mkCol.getContext('2d');   // 彩色噪域：颜色层
 
 /** ★★ 实机语义的噪域掩码：**减算块是"反转该区域的噪域状态"，不是挖洞**。
  *
@@ -5368,8 +5379,9 @@ function renderStage() {
   const nActive = quads.filter(q => q.active).length;
 
   if (S.machineTruth) {
-    // ★ 实机贴合：红 = 实机真正会渲染出噪域的区域 = U XOR K1（见 machineMask 的语义说明）。
+    // ★ 实机贴合：区域 = U XOR K1（见 machineMask 的语义说明），**按噪域颜色渲染**。
     //   注意【减算块是反转，不是挖洞】：没有普通块 + 恰好一个减算块的地方，实机会【显示噪域】。
+    //   颜色规则：同一像素被多个噪域覆盖 → 后画（更高 zOrder / 更大线号）的颜色在上。
     const actN = quads.filter(q => !q.subtract && q.active).map(q => q.cs);
     const actS = quads.filter(q => q.subtract && q.active).map(q => q.cs);
     const inaN = quads.filter(q => !q.subtract && !q.active).map(q => q.cs);
@@ -5381,11 +5393,30 @@ function renderStage() {
     mkInaCtx.globalCompositeOperation = 'destination-out';
     mkInaCtx.drawImage(mkAct, 0, 0);
     mkInaCtx.globalCompositeOperation = 'source-over';
-    sctx.globalAlpha = 0.15; sctx.drawImage(mkIna, 0, 0, w, h);
-    sctx.globalAlpha = 0.45; sctx.drawImage(mkAct, 0, 0, w, h);
-    sctx.globalAlpha = 1;
-  } else {
-    // 编辑视图：填充色 = 噪域颜色（默认红）；减算块用虚线边框区分。
+    /** 把一组 quad 按颜色画到 mkCol，再用掩码裁形，最后按 alpha 叠到舞台 */
+    const paintMaskedColor = (list, mask, alpha) => {
+      mkCol.width = mkAct.width; mkCol.height = mkAct.height;
+      mkColx.setTransform(1, 0, 0, 1, 0, 0);
+      mkColx.clearRect(0, 0, mkCol.width, mkCol.height);
+      mkColx.globalCompositeOperation = 'source-over';
+      for (const q of list) {
+        mkColx.beginPath(); mkColx.moveTo(q.cs[0].x, q.cs[0].y);
+        for (let k = 1; k < 4; k++) mkColx.lineTo(q.cs[k].x, q.cs[k].y);
+        mkColx.closePath();
+        mkColx.fillStyle = CORE.colorCss(q.color, 1);
+        mkColx.fill();
+      }
+      mkColx.globalCompositeOperation = 'destination-in';
+      mkColx.drawImage(mask, 0, 0, mkCol.width, mkCol.height);
+      mkColx.globalCompositeOperation = 'source-over';
+      sctx.globalAlpha = alpha;
+      sctx.drawImage(mkCol, 0, 0, w, h);
+      sctx.globalAlpha = 1;
+    };
+    paintMaskedColor(quads.filter(q => !q.active), mkIna, 0.15);
+    paintMaskedColor(quads.filter(q => q.active), mkAct, 0.72);
+  } else if (S.colorPreview) {
+    // 编辑视图（彩色预览开）：填充色 = 噪域颜色（默认红）；减算块用虚线边框区分。
     // ★ 画序已按 zOrder/序号排好：重叠处后画的（更高 zOrder / 更大线号）颜色在上，
     //   与 RPE 的遮挡规则一致（"最高 zOrder 或线号在最上方"）。
     for (const q of quads) {
@@ -5398,6 +5429,22 @@ function renderStage() {
       sctx.setLineDash(q.subtract ? [5, 3] : []);
       sctx.fill(); sctx.stroke();
       sctx.setLineDash([]);
+    }
+  } else {
+    // 编辑视图（彩色预览关）：恢复旧配色 —— 普通块红、减算块蓝；未生效低不透明度。
+    for (const q of quads) {
+      sctx.beginPath(); sctx.moveTo(q.cs[0].x, q.cs[0].y);
+      for (let k = 1; k < 4; k++) sctx.lineTo(q.cs[k].x, q.cs[k].y);
+      sctx.closePath();
+      if (q.subtract) {
+        sctx.fillStyle = q.active ? 'rgba(86,150,255,.30)' : 'rgba(86,150,255,.10)';
+        sctx.strokeStyle = q.active ? 'rgba(125,176,255,.95)' : 'rgba(125,176,255,.45)';
+      } else {
+        sctx.fillStyle = q.active ? 'rgba(255,86,86,.30)' : 'rgba(255,86,86,.10)';
+        sctx.strokeStyle = q.active ? 'rgba(255,120,120,.95)' : 'rgba(255,120,120,.45)';
+      }
+      sctx.lineWidth = q.active ? 1.6 : 1;
+      sctx.fill(); sctx.stroke();
     }
   }
 
@@ -5488,7 +5535,11 @@ function renderStage() {
 
   let hud = `t=${S.time.toFixed(3)}s  beat=${tBeat.toFixed(3)}  (${CORE.fmtBeat(CORE.beatsToTriple(tBeat, S.snapN))})\n` +
     `可见噪域 ${drawn} / ${S.areas.length}（生效 ${nActive} · 未生效 ${drawn - nActive}）   音符 ${nNotes}\n` +
-    `渲染 ${S.machineTruth ? '实机贴合：红=实机会渲染出噪域的区域（含减算块反转出来的块）' : '编辑视图：填充=噪域颜色（默认红），虚线=减算块；重叠按 zOrder/序号遮挡'}   范围 ${Math.round(v.vw)}×${Math.round(v.vh)}`;
+    `渲染 ${S.machineTruth
+      ? '实机贴合：按噪域颜色渲染（区域 = U XOR 恰好 1 个减算块；重叠按 zOrder/线号遮挡）'
+      : (S.colorPreview
+        ? '编辑视图：填充=噪域颜色（默认红），虚线=减算块；重叠按 zOrder/序号遮挡'
+        : '编辑视图：红=普通块 蓝=减算块（彩色噪域预览已关）')}   范围 ${Math.round(v.vw)}×${Math.round(v.vh)}`;
   if (S.now) hud += `\n● 预览已改动（点 ⟲ 写入事件）`;
       { const nSel = collectSel().length; if (nSel > 1) hud += `\n● 已选 ${nSel} 个事件（Ctrl+点击增删 · ↑↓ 按吸附步长移动 · Delete 删除全部）`; }
   $('hud').textContent = hud;
@@ -5883,7 +5934,7 @@ const MENU_CATS = [
   { id: 'noise', label: '噪域信息管理', hint: '新建 · 速查 · 统计', ids: ['btnAdd', 'btnHelp'],
     note: '＋ = 在播放头处新建噪域；复制/删除噪域在面板上方的「事件」栏。' },
   { id: 'export', label: '导出功能', hint: '官方 / RPE / pez',
-    ids: ['btnExpAreaList', 'btnExportPhi', 'btnExport', 'btnExportPez', 'btnExpRpePez', 'lblRpeLines'],
+    ids: ['btnExpAreaList', 'btnExportPhi', 'btnExport', 'btnExportPez', 'btnExpRpePez', 'btnExpRpePezNoise'],
     note: '★「仅导出噪域数据」是主路径：只输出官方 blockAreaList.json，给 RPE Recorder 原生读噪域。' },
   { id: 'batch', label: '批量编辑', hint: '多选 · 克隆到其它噪域', ids: ['btnBatch'],
     note: '批量编辑：拖动多选事件，或把选中事件克隆到其它噪域。' },
@@ -6995,6 +7046,8 @@ $('btnHelp').onclick = () => $('dlgHelp').showModal();
 $('btnAudio').onclick = () => $('fileAudio').click();
 // ★ 「判定覆盖」已按用户要求整体移除（连热力图与提示文本）；原位置换成「实机贴合」开关。
 $('chkMachine').onchange = ev => { S.machineTruth = ev.target.checked; renderStage(); };
+// ★ 彩色噪域预览：只影响编辑视图（实机贴合始终按噪域颜色渲染）
+$('chkColorPreview').onchange = ev => { S.colorPreview = ev.target.checked; renderStage(); };
 // ★ 噪域编号开关：在判定框里各噪域对应位置显示编号（绘制在 renderStage，见 S.showAreaIdx 处注释）
 S.showMh = $('chkMh').checked;                     // 与标记里的 checked 对齐（默认开）
 $('chkMh').onchange = ev => { S.showMh = ev.target.checked; S.rev++; renderStage(); status('双押提示 ' + (S.showMh ? '开（用 _mh 贴图）' : '关（保持红/蓝原色）'), 2400); };
@@ -8024,7 +8077,7 @@ document.getElementById('bpDelAreas').onclick = () => {
 async function writeToRpeDir() {
   if (!window.showDirectoryPicker) return status('此浏览器不支持直接写目录，请用 Chrome/Edge', 5000);
   if (!S.areas.length) return status('还没有噪域可导出', 3000);
-  const obj = buildRpeObj();
+  const obj = buildRpeObj({ keepNoiseLines: true });
   if (!obj) return status('尚未载入谱面', 2500);
   let dir;
   try { dir = await window.showDirectoryPicker({ mode: 'readwrite', id: 'rpeDir' }); }
@@ -8045,8 +8098,7 @@ async function writeToRpeDir() {
     await w.write(text);
     await w.close();
   } catch (e) { return status('写入失败：' + e.message, 5000); }
-  status('已写回 ' + target + '（' + S.areas.length + ' 个噪域，官方 blockAreaList'
-    + (S.rpeNoiseLines ? ' + ' + rpeNoiseLineCount(obj) + ' 条 Line2Area 判定线（合并后）' : '') + '）', 8000);
+  status('已写回 ' + target + '（' + S.areas.length + ' 个噪域，官方 blockAreaList；源 Line2Area 判定线原样保留）', 8000);
 }
 
 /* ---------- 仅导出噪域数据：官方格式 blockAreaList.json ----------
@@ -8079,7 +8131,8 @@ function exportAreaList() {
    · 把所有噪域判定线（Texture = isSubtract0/1.png）过滤掉
    · 不带 isSubtract0/1.png 贴图
    给「原生适配官谱噪域」的渲染器用：噪域走 blockAreaList，判定线列表保持干净。 */
-async function exportRpePezPlain() {
+async function exportRpePezMode(includeNoise) {
+  const withNoise = !!includeNoise;
   const rec = rpeCharts[rpeIdx];
   const bytes = async (x) => new Uint8Array(await (x.handle ? await x.handle.getFile() : x.file).arrayBuffer());
   let song = '', pic = '', musicData = null, picData = null;
@@ -8100,12 +8153,16 @@ async function exportRpePezPlain() {
     if (!f) return status('已取消：pez 需要插图，否则 Phira 播放会报 os error 5', 6000);
     picData = new Uint8Array(await f.arrayBuffer()); pic = f.name.replace(/[\\/:*?"<>|]/g, '_');
   }
-  const o = buildRpeObj();                       // RPE 格式（含 blockAreaList）
+  const o = buildRpeObj({ noiseLines: withNoise });   // RPE 格式（含 blockAreaList）
   if (!o) return status('尚未载入谱面', 2500);
-  // ★ 去掉所有噪域判定线（含以前导出留下的）
-  const before = (o.judgeLineList || []).length;
-  o.judgeLineList = (o.judgeLineList || []).filter(l => CORE.recorderSubtractOf(l.Texture) < 0);
-  const removed = before - o.judgeLineList.length;
+  let removed = 0;
+  if (!withNoise) {
+    // ★ 去掉所有噪域判定线（含以前导出留下的）
+    const before = (o.judgeLineList || []).length;
+    o.judgeLineList = (o.judgeLineList || []).filter(l => CORE.recorderSubtractOf(l.Texture) < 0);
+    removed = before - o.judgeLineList.length;
+  }
+  const noiseLines = withNoise ? rpeNoiseLineCount(o) : 0;
   const rawId = (S.doc && S.doc.META && S.doc.META.id) || S.docName || 'chart';
   const id = String(rawId).replace(/[\\/:*?"<>|]/g, '_').replace(/[^\x20-\x7e\u4e00-\u9fff]/g, '_').slice(0, 64) || 'chart';
   const m = (S.doc && S.doc.META) || {};
@@ -8122,22 +8179,16 @@ async function exportRpePezPlain() {
     duration: (m.duration > 0) ? m.duration
       : ((isFinite(audio.duration) && audio.duration > 0) ? audio.duration : (S.total || 0)),
   })) });
-  download(await zipBuild(files), (m.name || id) + '-rpe.pez');
-  status('已导出 RPE pez：' + files.length + ' 个文件（RPE 谱面 + blockAreaList + 音乐 + 插图 + info.txt' +
-         (removed ? '，已去掉 ' + removed + ' 条噪域判定线' : '') + '）', 6000);
+  download(await zipBuild(files), (m.name || id) + (withNoise ? '-rpe-noise.pez' : '-rpe.pez'));
+  status((withNoise ? '已导出 RPE pez（含噪域线）' : '已导出 RPE pez（无噪域线）') + '：' + files.length + ' 个文件' +
+         '（RPE 谱面 + blockAreaList + 音乐 + 插图 + info.txt' +
+         (withNoise ? '；含 ' + noiseLines + ' 条 Line2Area 判定线（合并后，带颜色事件）' :
+                      (removed ? '；已去掉 ' + removed + ' 条噪域判定线' : '')) + '）', 8000);
 }
-document.getElementById('btnExpRpePez').onclick = exportRpePezPlain;
-/* 「RPE 含噪域线」开关：只影响 buildRpeObj（导出 RPE / 写回目录）。
-   ★ RPE 播放器把噪域线当普通判定线画 —— 只有 RPE Recorder / Phira Pro 这类认 Line2Area 的渲染器才该开。 */
-{
-  const chk = document.getElementById('chkRpeLines');
-  if (chk) chk.addEventListener('change', (e) => {
-    S.rpeNoiseLines = !!e.target.checked;
-    status(S.rpeNoiseLines
-      ? 'RPE 导出：噪域将写成 Line2Area 判定线（isSubtract*.png + speed 道生命周期 + 归一化 anchor）'
-      : 'RPE 导出：噪域只走 blockAreaList（不生成噪域判定线）', 5000);
-  });
-}
+document.getElementById('btnExpRpePez').onclick = () => exportRpePezMode(false);
+document.getElementById('btnExpRpePezNoise').onclick = () => exportRpePezMode(true);
+/* 「RPE 含噪域线」不再做开关：普通「导出 RPE / 写回目录」不写噪域线；
+   需要 Line2Area 判定线请用「导出 RPE pez（含噪域线）」（RPE Recorder / Phira Pro 这类渲染器才认）。 */
 document.getElementById('btnExpAreaList').onclick = exportAreaList;
 document.getElementById('btnWriteDir').onclick = writeToRpeDir;
 
