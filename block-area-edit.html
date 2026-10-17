@@ -2294,17 +2294,87 @@ function lifeToSpeedEvents(T, chartEnd) {
   return out;
 }
 
+/* ===== 线性关键帧压缩（RDP，垂直距离） =====
+   烘焙 / 分层 / 窗口裁切出来的轨都是"线性事件"，连续段里大量点可以删掉而不超过容差。
+   跳变 / 空档处切开，绝不把阶跃剪成斜坡；输出仍满足"段长 > 0、互不重叠"。 */
+const SIMPLIFY_POS = 0.7;                 // RPE 单位
+const SIMPLIFY_ROT = 0.15;                // 度
+const SIMPLIFY_SCALE = 0.7 / RPE_HEIGHT;  // 宽高倍率
+
+/** 对 [{t,v}]（t 严格递增）做垂距 RDP，返回保留的关键帧 */
+function simplifyKeyList(keys, tol) {
+  const n = keys.length;
+  if (n <= 2) return keys.slice();
+  const keep = new Uint8Array(n);
+  keep[0] = keep[n - 1] = 1;
+  const stack = [[0, n - 1]];
+  while (stack.length) {
+    const seg = stack.pop();
+    const i = seg[0], j = seg[1];
+    const ti = keys[i].t, tj = keys[j].t, dt = tj - ti;
+    const vi = keys[i].v, vj = keys[j].v;
+    let best = -1, bi = -1;
+    for (let k = i + 1; k < j; k++) {
+      const pred = dt > 1e-12 ? vi + (vj - vi) * (keys[k].t - ti) / dt : vi;
+      const d = Math.abs(keys[k].v - pred);
+      if (d > best) { best = d; bi = k; }
+    }
+    if (best > tol && bi > i) { keep[bi] = 1; stack.push([i, bi], [bi, j]); }
+  }
+  const out = [];
+  for (let k = 0; k < n; k++) if (keep[k]) out.push(keys[k]);
+  return out;
+}
+
+/** 线性事件数组压缩：在跳变 / 空档处切成 run，每段单独 RDP 后重建。
+ *  ★ 只接受全线性（easing=1）的轨；带缓动的结构直译轨不要走这里（会丢曲线）。 */
+function simplifyLinearEvents(evs, tol) {
+  if (!evs || evs.length <= 2 || !(tol > 0)) return (evs || []).slice();
+  const runs = [];
+  let run = [], lastT = null, lastV = null;
+  const flush = () => { if (run.length >= 2) runs.push(run); run = []; };
+  for (const e of evs) {
+    const t0 = tripleToBeats(e.startTime), t1 = tripleToBeats(e.endTime);
+    const v0 = e.start, v1 = e.end;
+    if (!(t1 > t0 + 1e-9)) continue;
+    if (lastT != null) {
+      const gap = t0 > lastT + 1e-9;
+      const jump = Math.abs(t0 - lastT) <= 1e-9 && Math.abs(v0 - lastV) > 1e-9;
+      if (gap || jump) flush();
+    }
+    if (!run.length) run.push({ t: t0, v: v0 });
+    run.push({ t: t1, v: v1 });
+    lastT = t1; lastV = v1;
+  }
+  flush();
+  const out = [];
+  for (const r of runs) {
+    const keys = simplifyKeyList(r, tol);
+    for (let i = 0; i + 1 < keys.length; i++) {
+      const a = keys[i], b = keys[i + 1];
+      if (b.t > a.t + 1e-9) out.push(mkRpeEv(a.t, b.t, a.v, b.v, 1));
+    }
+  }
+  return out;
+}
+
 /** 内部事件轨 → RPE 事件数组（结构直译用）。conv 负责单位/符号换算，def 是该轨在
  *  「首个事件之前」的求值默认值（与 areaState 一致：中心=bx/by、宽=1350、高=900、旋转=0）。
  *  ★★ RPE 事件必须满足：startTime < endTime（无零长），且同轨内互不重叠。
  *   内部轨却可能有【零长事件 / 重叠事件】（用户编辑、合成数据、Recorder 源的负时间初始化事件），
  *   所以这里按【所有事件的 start/end 断点】重写整条轨：
  *     · 段恰好等于某个源事件的完整区间 → 原样保留缓动/贝塞尔/切割（逐位还原）；
- *     · 段被断点切开（重叠、零长、负时间） → 用有效求值细分线性（K=16）逼近；
+ *     · 段被断点切开（重叠、零长、负时间）→ 用有效求值细分线性（K=16）逼近；
+ *     · 30/31（官方 Zero/One）→ 段内常量（Zero 保前值 / One 立刻跳到终值），跳变交给边界；
+ *     · 带事件层（layers>1）的合并轨 → 整段按层感知求值细分线性（单层输出表达不了多层）；
  *     · 空档 / 跨事件边界 → 线性（相当于 RPE 的"保持"）。
- *   零长事件于是自然变成"t 处的一次跳变"：前一段在 t 结束、后一段从 t 开始，不会写出零长段。 */
-function trackToRpe(track, conv, def, tEnd) {
+ *   零长事件于是自然变成"t 处的一次跳变"：前一段在 t 结束、后一段从 t 开始，不会写出零长段。
+ *   tol>0 时对【纯线性生成】的轨（分层轨）做 RDP 压缩，事件量可降一个数量级。 */
+function trackToRpe(track, conv, def, tEnd, tol) {
+  // ★ 必须在 slice 之前取 layers：Array#slice 不保留自定义属性
+  const layered = !!(track && track.layers && track.layers.length > 1);
   const src = (track || []).slice().sort((p, q) => p.start - q.start);
+  if (layered) src.layers = track.layers;
   const out = [];
   const defVal = (def == null ? 0 : def);
   const toVal = (v) => conv(v == null ? defVal : v);
@@ -2329,7 +2399,10 @@ function trackToRpe(track, conv, def, tEnd) {
     const valR = (t) => evalNum(src, t, defVal);                       // 右极限（t 处新事件生效）
     const valL = (t) => evalNum(src, Math.max(t0, t - 1e-9), defVal);  // 左极限（段末只取到 t1⁻）
     const whole = !!e && e.start <= t0 + EPS && e.end >= t1 - EPS;
-    const exact = whole && Math.abs(e.start - t0) <= EPS && Math.abs(e.end - t1) <= EPS;
+    const ez = e ? (e.easing == null ? 1 : e.easing) : 1;
+    const unsafe = (ez === 30 || ez === 31);
+    const exact = whole && !layered && !unsafe &&
+                  Math.abs(e.start - t0) <= EPS && Math.abs(e.end - t1) <= EPS;
     if (exact) {
       const extra = {
         easingLeft: (e.ezL == null ? 0 : e.ezL),
@@ -2338,8 +2411,11 @@ function trackToRpe(track, conv, def, tEnd) {
       if (e.bez && e.bez.length === 4) { extra.bezier = 1; extra.bezierPoints = e.bez.slice(); }
       // 用源事件的 a/b（而不是端点求值）：保留缓动曲线本身
       pushEv(t0, t1, e.a == null ? defVal : e.a, e.b == null ? defVal : e.b, e.easing, extra);
-    } else if (whole) {
-      // 被别的断点切开的缓动段：单段缓动表达不了剩余曲线 → 细分线性
+    } else if (unsafe) {
+      // Zero(30)：段内恒为起始值；One(31)：段内恒为终值。跳变由相邻段边界表达
+      pushEv(t0, t1, valR(t0), valL(t1), 1, null);
+    } else if (layered || whole) {
+      // 带层 / 被断点切开的缓动段：单段缓动表达不了 → 细分线性
       const K = 16;
       for (let k = 0; k < K; k++) {
         const a = t0 + (t1 - t0) * k / K, b = t0 + (t1 - t0) * (k + 1) / K;
@@ -2352,13 +2428,16 @@ function trackToRpe(track, conv, def, tEnd) {
   }
   // ★ 尾部：最后一个断点之后还要写一段"保持当前有效值"——
   //   否则末尾的【零长事件】所表达的阶跃会丢（前一段的 end 仍是跳变前的值，RPE 会一直保持它）。
-  //   同时也是所有轨道的收尾（RPE 事件列表不以 0 时长结尾，段长 = 到谱面末端）。
+  //   但若最后一段的终值已经等于保持值，则不必多写一段。
   {
     const lastT = times.length ? times[times.length - 1] : 0;
     const tailEnd = (isFinite(tEnd) && tEnd > lastT + EPS) ? tEnd : lastT + 1;
-    const v = evalNum(src, lastT, defVal);
-    pushEv(lastT, tailEnd, v, v, 1, null);
+    const vHeld = toVal(evalNum(src, lastT, defVal));
+    const prev = out[out.length - 1];
+    if (!prev || Math.abs(prev.end - vHeld) > 1e-9) pushEv(lastT, tailEnd, vHeld, vHeld, 1, null);
   }
+  // 分层轨整条都是线性生成 → 压缩（结构轨带缓动，不能压缩）
+  if (layered && tol > 0) return simplifyLinearEvents(out, tol);
   return out;
 }
 
@@ -2378,16 +2457,11 @@ function sanitizeRpeEvents(evs) {
   return out;
 }
 
-/** 结构直译是否成立：rect 模式 + 无事件层 + 无官方 Zero-One(30/31) 缓动 + 未强制烘焙。 */
+/** 结构直译是否成立：rect 模式且没被强制烘焙。
+ *  事件层 / 30·31 缓动都不再导致整块烘焙 —— 分层轨按层感知细分 + RDP 压缩（保留 anchor/father），
+ *  30/31 在段内写成常量 + 边界跳变。 */
 function canStructLine(a, forceBake) {
-  if (!a || forceBake || anchorModeOf(a) !== 'rect') return false;
-  const T = a.tracks || a;
-  for (const k of ['centerX', 'centerY', 'width', 'height', 'rotation']) {
-    const tr = T[k] || [];
-    if (tr.layers && tr.layers.length > 1) return false;
-    for (const e of tr) if (e.easing === 30 || e.easing === 31) return false;
-  }
-  return true;
+  return !!(a && !forceBake && anchorModeOf(a) === 'rect');
 }
 
 /** 烘焙路径：把渲染后的世界中心/尺寸/角度密集采样成线性关键帧。
@@ -2440,7 +2514,56 @@ function bakeLineTracks(a, aspect, chartEnd) {
     }
     prev = cur;
   }
-  return { moveX, moveY, scaleX, scaleY, rotate };
+  return {
+    moveX: simplifyLinearEvents(moveX, SIMPLIFY_POS),
+    moveY: simplifyLinearEvents(moveY, SIMPLIFY_POS),
+    scaleX: simplifyLinearEvents(scaleX, SIMPLIFY_SCALE),
+    scaleY: simplifyLinearEvents(scaleY, SIMPLIFY_SCALE),
+    rotate: simplifyLinearEvents(rotate, SIMPLIFY_ROT),
+  };
+}
+
+/** 组装一条 Line2Area 噪域判定线（单区导出 / 合并导出共用）。
+ *  兜底默认值与 areaState 一致：中心=0、宽=RPE_WIDTH、高=RPE_HEIGHT、旋转=0；
+ *  最终 sanitize：零长/负长/重叠一律不写。 */
+function makeNoiseLine(p) {
+  const tEnd = (isFinite(p.chartEnd) && p.chartEnd > 0) ? p.chartEnd : 1;
+  const one = (v) => [{ startTime: beatTriple(0), endTime: beatTriple(tEnd),
+                        start: v, end: v, easingType: 1, bezier: 0, bezierPoints: [0, 0, 0, 0],
+                        easingLeft: 0, easingRight: 1, linkgroup: 0 }];
+  const fix = (arr, def) => {
+    const sane = sanitizeRpeEvents((arr && arr.length) ? arr : one(def));
+    return sane.length ? sane : one(def);
+  };
+  const mX = fix(p.mX, p.defX || 0);
+  const mY = fix(p.mY, p.defY || 0);
+  const sX = fix(p.sX, p.defW == null ? encScale(RPE_WIDTH) : p.defW);
+  const sY = fix(p.sY, p.defH == null ? encScale(RPE_HEIGHT) : p.defH);
+  const rot = fix(p.rot, 0);
+  const speedEvs = sanitizeRpeEvents(p.speed || []);
+  const anchor = p.anchor || [0.5, 0.5];
+  const longEnd = [9999999, 0, 1];
+  return {
+    Group: 0,
+    Name: '噪域' + ((p.index != null) ? ('#' + (p.index + 1)) : ''),
+    Texture: p.subtract ? 'isSubtract1.png' : 'isSubtract0.png',
+    alphaControl: [{ x: 0, alpha: 1, easing: 1 }, { x: 9999999, alpha: 1, easing: 1 }],
+    anchor: [anchor[0], anchor[1]],
+    bpmfactor: 1,
+    eventLayers: [{
+      alphaEvents: [{ startTime: beatTriple(0), endTime: longEnd, start: 255, end: 255,
+                      easingType: 1, bezier: 0, bezierPoints: [0, 0, 0, 0], easingLeft: 0, easingRight: 1, linkgroup: 0 }],
+      moveXEvents: mX, moveYEvents: mY, rotateEvents: rot, speedEvents: speedEvs,
+    }],
+    extended: { inclineEvents: [], scaleXEvents: sX, scaleYEvents: sY },
+    father: (p.father == null ? -1 : p.father),
+    isCover: 1, isGif: false, numOfNotes: 0,
+    posControl: [{ x: 0, pos: 1, easing: 1 }, { x: 9999999, pos: 1, easing: 1 }],
+    sizeControl: [{ x: 0, size: 1, easing: 1 }, { x: 9999999, size: 1, easing: 1 }],
+    skewControl: [{ x: 0, skew: 0, easing: 1 }, { x: 9999999, skew: 0, easing: 1 }],
+    yControl: [{ x: 0, y: 1, easing: 1 }, { x: 9999999, y: 1, easing: 1 }],
+    zOrder: 0,
+  };
 }
 
 /** 内部噪域 → RPE 判定线对象（供 rpeWithNoiseLines 追加到 judgeLineList）。
@@ -2456,11 +2579,11 @@ function areaToRecorderLine(a, opts) {
   let father = (o.father == null ? -1 : o.father);
   let mX, mY, sX, sY, rot, anchor = [0.5, 0.5];
   if (canStructLine(a, o.forceBake)) {
-    mX = trackToRpe(T.centerX, v => v, a.bx || 0, o.chartEnd);
-    mY = trackToRpe(T.centerY, v => v, a.by || 0, o.chartEnd);
-    sX = trackToRpe(T.width, v => encScale(v), RPE_WIDTH, o.chartEnd);
-    sY = trackToRpe(T.height, v => encScale(v), RPE_HEIGHT, o.chartEnd);
-    rot = trackToRpe(T.rotation, v => -v, 0, o.chartEnd);   // RPE 的旋转与内部相反（buildLines 里 ×(-1)）
+    mX = trackToRpe(T.centerX, v => v, a.bx || 0, o.chartEnd, SIMPLIFY_POS);
+    mY = trackToRpe(T.centerY, v => v, a.by || 0, o.chartEnd, SIMPLIFY_POS);
+    sX = trackToRpe(T.width, v => encScale(v), RPE_WIDTH, o.chartEnd, SIMPLIFY_SCALE);
+    sY = trackToRpe(T.height, v => encScale(v), RPE_HEIGHT, o.chartEnd, SIMPLIFY_SCALE);
+    rot = trackToRpe(T.rotation, v => -v, 0, o.chartEnd, SIMPLIFY_ROT);  // RPE 的旋转与内部相反（buildLines 里 ×(-1)）
     if (!a.lockAnchor) {
       const stR = storedRectAnchor(a);
       if (stR) {
@@ -2474,50 +2597,450 @@ function areaToRecorderLine(a, opts) {
     mX = baked.moveX; mY = baked.moveY; sX = baked.scaleX; sY = baked.scaleY; rot = baked.rotate;
     father = -1;                                      // 烘焙的是世界坐标 ⇒ 不再挂父线
   }
-  const tEndFallback = (isFinite(o.chartEnd) && o.chartEnd > 0) ? o.chartEnd : 1;
-  const one = (v) => [{ startTime: beatTriple(0), endTime: beatTriple(tEndFallback),
-                        start: v, end: v, easingType: 1, bezier: 0, bezierPoints: [0, 0, 0, 0],
-                        easingLeft: 0, easingRight: 1, linkgroup: 0 }];
-  // ★ 兜底默认值与 areaState 一致：中心=bx/by、宽=RPE_WIDTH、高=RPE_HEIGHT、旋转=0
-  if (!mX.length) mX = one(a.bx || 0);
-  if (!mY.length) mY = one(a.by || 0);
-  if (!rot.length) rot = one(0);
-  if (!sX.length) sX = one(encScale(RPE_WIDTH));
-  if (!sY.length) sY = one(encScale(RPE_HEIGHT));
-  // ★ 最终校验：零长/负长/重叠一律不写（RPE 事件必须是"严格递增、互不重叠、段长>0"）
-  mX = sanitizeRpeEvents(mX); mY = sanitizeRpeEvents(mY);
-  sX = sanitizeRpeEvents(sX); sY = sanitizeRpeEvents(sY);
-  rot = sanitizeRpeEvents(rot); 
-  const speedEvs = sanitizeRpeEvents(speed);
-  const longEnd = [9999999, 0, 1];
-  return {
-    Group: 0,
-    Name: '噪域' + ((o.index != null) ? ('#' + (o.index + 1)) : ''),
-    Texture: a.subtract ? 'isSubtract1.png' : 'isSubtract0.png',
-    alphaControl: [{ x: 0, alpha: 1, easing: 1 }, { x: 9999999, alpha: 1, easing: 1 }],
-    anchor: [anchor[0], anchor[1]],
-    bpmfactor: 1,
-    eventLayers: [{
-      alphaEvents: [{ startTime: beatTriple(0), endTime: longEnd, start: 255, end: 255,
-                      easingType: 1, bezier: 0, bezierPoints: [0, 0, 0, 0], easingLeft: 0, easingRight: 1, linkgroup: 0 }],
-      moveXEvents: mX, moveYEvents: mY, rotateEvents: rot, speedEvents: speedEvs,
-    }],
-    extended: { inclineEvents: [], scaleXEvents: sX, scaleYEvents: sY },
-    father: father,
-    isCover: 1, isGif: 0, numOfNotes: 0,
-    posControl: [{ x: 0, pos: 1, easing: 1 }, { x: 9999999, pos: 1, easing: 1 }],
-    sizeControl: [{ x: 0, size: 1, easing: 1 }, { x: 9999999, size: 1, easing: 1 }],
-    skewControl: [{ x: 0, skew: 0, easing: 1 }, { x: 9999999, skew: 0, easing: 1 }],
-    yControl: [{ x: 0, y: 1, easing: 1 }, { x: 9999999, y: 1, easing: 1 }],
-    zOrder: 0,
+  return makeNoiseLine({
+    mX, mY, sX, sY, rot, speed, anchor, father,
+    subtract: a.subtract, index: o.index, chartEnd: o.chartEnd,
+    defX: a.bx || 0, defY: a.by || 0,
+  });
+}
+
+/* ==================== 最大合并：时间不重叠的噪域共用一条判定线 ====================
+   一条 Line2Area 线的 speed 道本来就支持多段【出现/激活/失活/消失】。
+   只要两个噪域占用的时间段（visible ∪ active，未收尾 → 谱面末端）没有交集，
+   就能写进同一条线：任一时刻只会看到其中一个形状。
+   不同 anchor / father / abs 的噪域靠"重参数化"合并：
+     · struct：全部 rect 且【有效 anchor 相同、父线相同】→ 直接拼接各自的几何事件（最省、无损）；
+     · local ：父线相同但 anchor 不同 / 混有 abs → 中心改写成【父线局部坐标的渲染中心】（密集+简化），
+               尺寸/角度仍用各自的结构轨道；anchor=0.5、保留 father；
+     · world ：父线不同（或父线被删）→ 中心写成【世界坐标】；anchor=0.5、father=-1。
+   每组条数 = 该加减类型时间段的最大并发数（区间图贪心，接近理论下限）。 */
+
+function mergeIntervals(list) {
+  const iv = (list || []).slice().sort((x, y) => x[0] - y[0] || x[1] - y[1]);
+  const out = [];
+  for (const [s, e] of iv) {
+    const last = out[out.length - 1];
+    if (last && s <= last[1] + 1e-9) last[1] = Math.max(last[1], e);
+    else out.push([s, e]);
+  }
+  return out;
+}
+
+/** 噪域"占用"的时间段：visible 与 active 的 true 区间的并集（未收尾 → chartEnd） */
+function areaSpans(a, chartEnd) {
+  const T = (a && a.tracks) || a || {};
+  const iv = [];
+  for (const K of ['visible', 'active']) for (const e of (T[K] || [])) {
+    if (!e.a) continue;
+    const s = Math.max(0, e.start);
+    let en = (isFinite(e.end) && e.end < UNCLOSED_BEAT) ? e.end : chartEnd;
+    en = Math.min(en, chartEnd);
+    if (en > s + 1e-9) iv.push([s, en]);
+  }
+  return mergeIntervals(iv);
+}
+/** 两个时间段集合是否有交集 */
+function spansHit(A, B) {
+  let i = 0, j = 0;
+  while (i < A.length && j < B.length) {
+    if (A[i][1] > B[j][0] + 1e-9 && B[j][1] > A[i][0] + 1e-9) return true;
+    if (A[i][1] < B[j][1]) i++; else j++;
+  }
+  return false;
+}
+
+/** 同一父线（对象身份）视为一组；null = 无父线 */
+function fatherKeyOf(a) { return (a && a.parentLine) ? a.parentLine : null; }
+
+/** 一组噪域合并后需要的参数化模式：0=struct（最省，无损） 1=local 2=world（最重） */
+function binModeOf(list) {
+  if (!list || !list.length) return 2;
+  const f0 = fatherKeyOf(list[0]);
+  for (const a of list) if (fatherKeyOf(a) !== f0) return 2;
+  if (!list.every(a => anchorModeOf(a) === 'rect')) return 1;
+  const p0 = effRectAnchor(list[0]);
+  for (const a of list) {
+    const p = effRectAnchor(a);
+    if (Math.abs(p.x - p0.x) > 1e-9 || Math.abs(p.y - p0.y) > 1e-9) return 1;
+  }
+  return 0;
+}
+
+/** 合并成本估计：需要密采样中心的噪域数（中心轨带层 = 无论怎么选都要密采样，算半价） */
+function binCostOf(list, mode) {
+  if (!list || !list.length) return 0;
+  const A = (mode === 0) ? effRectAnchor(list[0]) : pickGroupAnchor(list, mode === 2 ? 'world' : 'local');
+  let cost = 0;
+  for (const a of list) {
+    const T = a.tracks || a;
+    const n = ((T.centerX || []).length) + 1;
+    if (anchorModeOf(a) !== 'rect') { cost += 4 * n; continue; }
+    const p = effRectAnchor(a);
+    const match = Math.abs(p.x - A.x) < 1e-9 && Math.abs(p.y - A.y) < 1e-9 &&
+                  (mode !== 2 || !a.parentLine);
+    if (!match) cost += (hasLayeredCenter(a) ? 2 : 1) * n;
+  }
+  return cost;
+}
+
+/** 一个合并箱的总代价：模式台阶（struct < local < world）+ 密采样成本 */
+function binScoreOf(list) {
+  const mode = binModeOf(list);
+  return mode * 1e9 + binCostOf(list, mode);
+}
+
+/** 一组条目的最大并发（同刻先 -1 再 +1，首尾相接不算并发） */
+function maxConcurrency(items) {
+  const ev = [];
+  for (const it of items) for (const [s, e] of it.sp) { ev.push([s, 1]); ev.push([e, -1]); }
+  ev.sort((x, y) => x[0] - y[0] || x[1] - y[1]);
+  let cur = 0, mx = 0;
+  for (const [, d] of ev) { cur += d; if (cur > mx) mx = cur; }
+  return mx;
+}
+
+/** 把噪域按"时间段互不重叠"装箱：每种 Texture（加/减算）分别装箱。
+ *  先多排序贪心 + 按父线分层贪心，取"条数最少 → 重参数化最轻"的方案；
+ *  若仍高于理论下界（最大并发），再反复把【时间段不相交】的两箱合并，直到逼近下界。 */
+function packNoiseAreas(areas, chartEnd) {
+  const groups = [];
+  for (const sub of [0, 1]) {
+    const items = [];
+    for (const a of (areas || [])) {
+      if ((a.subtract ? 1 : 0) !== sub) continue;
+      const sp = areaSpans(a, chartEnd);
+      if (!sp.length) continue;                       // 从未出现：不导出
+      items.push({ a, sp });
+    }
+    if (!items.length) continue;
+    const place = (bins, it) => {
+      for (const b of bins) if (!spansHit(b.spans, it.sp)) {
+        b.spans = mergeIntervals(b.spans.concat(it.sp)); b.items.push(it); return;
+      }
+      bins.push({ spans: mergeIntervals(it.sp.slice()), items: [it] });
+    };
+    const candidates = [];
+    const orders = [
+      (p, q) => p.sp[0][0] - q.sp[0][0] || p.sp[0][1] - q.sp[0][1],
+      (p, q) => q.sp[0][1] - p.sp[0][1] || p.sp[0][0] - q.sp[0][0],
+      (p, q) => q.sp.length - p.sp.length || p.sp[0][0] - q.sp[0][0],
+    ];
+    for (const cmp of orders) {
+      const bins = [];
+      for (const it of items.slice().sort(cmp)) place(bins, it);
+      candidates.push(bins);
+    }
+    // 按父线分层（同父线的先各自装箱 → 结构/局部模式更省）
+    {
+      const strata = new Map();
+      for (const it of items) {
+        const k = fatherKeyOf(it.a) || 'none';
+        if (!strata.has(k)) strata.set(k, []);
+        strata.get(k).push(it);
+      }
+      const bins = [];
+      for (const list of strata.values()) {
+        for (const it of list.slice().sort((p, q) => p.sp[0][0] - q.sp[0][0] || p.sp[0][1] - q.sp[0][1])) {
+          let placed = false;
+          for (const b of bins) {
+            if (fatherKeyOf(b.items[0].a) === fatherKeyOf(it.a) && !spansHit(b.spans, it.sp)) {
+              b.spans = mergeIntervals(b.spans.concat(it.sp)); b.items.push(it); placed = true; break;
+            }
+          }
+          if (!placed) bins.push({ spans: mergeIntervals(it.sp.slice()), items: [it] });
+        }
+      }
+      candidates.push(bins);
+    }
+    const lb = maxConcurrency(items);
+    // 每个候选先压到下界（合并时间段不相交的箱），再按"条数 → 参数化成本"打分
+    const reduceTo = (bins) => {
+      const out = bins.map(b => ({ spans: b.spans.slice(), items: b.items.slice() }));
+      while (out.length > lb) {
+        let bi = -1, bj = -1, bestCost = Infinity;
+        for (let i = 0; i < out.length; i++) for (let j = i + 1; j < out.length; j++) {
+          if (spansHit(out[i].spans, out[j].spans)) continue;
+          const merged = out[i].items.map(x => x.a).concat(out[j].items.map(x => x.a));
+          const cost = binScoreOf(merged);
+          if (cost < bestCost) { bestCost = cost; bi = i; bj = j; }
+        }
+        if (bi < 0) break;
+        out[bi] = { spans: mergeIntervals(out[bi].spans.concat(out[bj].spans)), items: out[bi].items.concat(out[bj].items) };
+        out.splice(bj, 1);
+      }
+      return out;
+    };
+    const scored = candidates.map(c => {
+      const r = reduceTo(c);
+      let cost = 0;
+      for (const b of r) cost += binScoreOf(b.items.map(x => x.a));
+      return { bins: r, score: r.length * 1e15 + cost };
+    });
+    scored.sort((x, y) => x.score - y.score);
+    const best = scored[0].bins;
+    for (const b of best) groups.push({
+      subtract: !!sub,
+      areas: b.items.map(x => x.a),
+      spans: b.spans,
+      mode: binModeOf(b.items.map(x => x.a)),
+    });
+  }
+  groups.sort((x, y) => (x.spans[0][0] - y.spans[0][0]) || (x.spans[0][1] - y.spans[0][1]));
+  return groups;
+}
+
+/** 理论最少条数下界：每种 Texture 的最大并发放进同一条线 → 各 Texture 的下界相加 */
+function packLowerBound(areas, chartEnd) {
+  let total = 0;
+  for (const sub of [0, 1]) {
+    const items = [];
+    for (const a of (areas || [])) {
+      if ((a.subtract ? 1 : 0) !== sub) continue;
+      const sp = areaSpans(a, chartEnd);
+      if (sp.length) items.push({ a, sp });
+    }
+    if (items.length) total += maxConcurrency(items);
+  }
+  return total;
+}
+
+/** 取一段可见/生效窗口内的事件，写成独立的内部事件（用于合并导出）。
+ *  窗口边界处裁切：完整事件保留缓动；被切开的子区间按有效求值细分线性。
+ *  分层轨整段按"层感知"求值细分线性（单层输出表达不了多层）。 */
+function clipTrackToWindows(track, windows, def) {
+  const layered = !!(track && track.layers && track.layers.length > 1);
+  const src = (track || []).slice().sort((p, q) => p.start - q.start);
+  if (layered) src.layers = track.layers;
+  const valAt = (t) => evalNum(src, t, def);
+  const pieces = [];
+  for (const [a, b] of windows) {
+    let cursor = a;
+    for (const e of src) {
+      if (!(e.end > a + 1e-9) || !(e.start < b - 1e-9)) continue;
+      const s = Math.max(e.start, a), en = Math.min(e.end, b);
+      if (!(en > s + 1e-9)) continue;
+      if (s > cursor + 1e-9) { const v = valAt(cursor); pieces.push({ start: cursor, end: s, a: v, b: v, easing: 1 }); }
+      const full = !layered && s <= e.start + 1e-9 && en >= e.end - 1e-9 &&
+                   e.easing !== 30 && e.easing !== 31;
+      if (full) {
+        pieces.push({ start: s, end: en, a: e.a == null ? def : e.a, b: e.b == null ? def : e.b,
+                      easing: e.easing, bez: e.bez, ezL: e.ezL, ezR: e.ezR });
+      } else {
+        const K = 16;
+        for (let k = 0; k < K; k++) {
+          const u = s + (en - s) * k / K, w = s + (en - s) * (k + 1) / K;
+          pieces.push({ start: u, end: w, a: valAt(u), b: valAt(w), easing: 1 });
+        }
+      }
+      if (en > cursor) cursor = en;
+    }
+    if (cursor < b - 1e-9) { const v = valAt(cursor); pieces.push({ start: cursor, end: b, a: v, b: v, easing: 1 }); }
+  }
+  return { pieces, layered };
+}
+
+/** 裁切后的内部事件 → RPE 事件（分层轨额外做 RDP 压缩） */
+function clippedTrackEvents(track, windows, def, conv, tol) {
+  if (!windows.length) return [];
+  const { pieces, layered } = clipTrackToWindows(track, windows, def);
+  const evs = [];
+  for (const p of pieces) {
+    if (!(p.end > p.start + 1e-9)) continue;
+    const extra = { easingLeft: (p.ezL == null ? 0 : p.ezL), easingRight: (p.ezR == null ? 1 : p.ezR) };
+    if (p.bez && p.bez.length === 4) { extra.bezier = 1; extra.bezierPoints = p.bez.slice(); }
+    evs.push(mkRpeEv(p.start, p.end, conv(p.a), conv(p.b), p.easing, extra));
+  }
+  const sane = sanitizeRpeEvents(evs);
+  return layered ? simplifyLinearEvents(sane, tol) : sane;
+}
+
+/** 线性关键帧 → RPE 事件（跳变已由 stepGuard 的保持点表达） */
+function keysToLinearEvents(keys, conv) {
+  const out = [];
+  for (let i = 0; i + 1 < keys.length; i++) {
+    const a = keys[i], b = keys[i + 1];
+    if (b.t > a.t + 1e-9) out.push(mkRpeEv(a.t, b.t, conv(a.v), conv(b.v), 1));
+  }
+  return out;
+}
+
+/** 合并导出用的中心轨：直接采样【渲染后的中心】（local = 父线局部坐标 / world = 世界坐标），
+ *  再用 RDP 压缩。尺寸与角度不需要烘焙（与 anchor/father 无关）。 */
+function denseCenterEvents(area, windows, world, aspect, chartEnd, anchor) {
+  if (!windows.length) return { x: [], y: [] };
+  const T = area.tracks || area;
+  const specs = [
+    { tr: T.centerX, delta: POS_SUB_UNITS }, { tr: T.centerY, delta: POS_SUB_UNITS },
+    { tr: T.width, delta: POS_SUB_UNITS }, { tr: T.height, delta: POS_SUB_UNITS },
+    { tr: T.rotation, delta: ROT_SUB_DEG },
+  ];
+  if (world) {
+    let p = area.parentLine, depth = 0;
+    while (p && depth++ < 16) {
+      specs.push({ tr: (p.ev && p.ev.x) || [], delta: POS_SUB_UNITS },
+                 { tr: (p.ev && p.ev.y) || [], delta: POS_SUB_UNITS },
+                 { tr: (p.ev && p.ev.rot) || [], delta: ROT_SUB_DEG });
+      p = p.parentLine;
+    }
+  }
+  const valFn = (t) => {
+    const st = world ? areaState(area, t, aspect, null) : localStateOf(area, t, aspect);
+    const dd = anchor ? rectDispForPivot(area, t, aspect, anchor.x, anchor.y) : { x: 0, y: 0 };
+    return [st.centerX - dd.x, st.centerY - dd.y];
   };
+  const xs = [], ys = [];
+  for (const [a, b] of windows) {
+    const grid = denseGridTimes(a, b, specs, null);
+    const keys = stepGuard(grid, valFn);
+    xs.push(...keysToLinearEvents(simplifyKeyList(keys.map(k => ({ t: k.t, v: k.v[0] })), SIMPLIFY_POS), v => v));
+    ys.push(...keysToLinearEvents(simplifyKeyList(keys.map(k => ({ t: k.t, v: k.v[1] })), SIMPLIFY_POS), v => v));
+  }
+  return { x: xs, y: ys };
+}
+
+/** 有效 rect anchor：锁锚/无记录 = 中心锚 (0.5,0.5)（此时中心轨直接就是线位置） */
+function effRectAnchor(a) {
+  if (!a || anchorModeOf(a) !== 'rect' || a.lockAnchor) return { x: 0.5, y: 0.5 };
+  const st = storedRectAnchor(a);
+  if (!st) return { x: 0.5, y: 0.5 };
+  const b = baseSizeOf(a);
+  const p = anchorToRectPivot(st.ax, st.ay, b.w, b.h);
+  return { x: isFinite(p.x) ? p.x : 0.5, y: isFinite(p.y) ? p.y : 0.5 };
+}
+
+/** rect 模式：任意归一化支点 (px,py) 的支点位移 d（与 anchorDisp 的 rect 分支同一公式） */
+function rectDispForPivot(area, tBeat, aspect, px, py) {
+  const T = area.tracks || area;
+  const W = T.width || [], H = T.height || [], R = T.rotation || [];
+  const A = aspect || DEFAULT_ASPECT;
+  const kx = 1 / (RPE_WIDTH / 2), ky = 1 / ((RPE_HEIGHT / 2) * A);
+  const wB = W.length ? Math.abs(W[0].a) : RPE_WIDTH;
+  const hB = H.length ? Math.abs(H[0].a) : RPE_HEIGHT;
+  const wN = W.length ? Math.abs(evalNum(W, tBeat, wB)) : wB;
+  const hN = H.length ? Math.abs(evalNum(H, tBeat, hB)) : hB;
+  const ax = -(px - 0.5) * wB, ay = -(py - 0.5) * hB;
+  const sx = wB ? wN / wB : 1, sy = hB ? hN / hB : 1;
+  const X = -ax * sx * kx, Y = ay * sy * ky;
+  const rot = evalNum(R, tBeat, 0) * Math.PI / 180;
+  const cs = Math.cos(rot), sn = Math.sin(rot);
+  const X2 = cs * X - sn * Y, Y2 = sn * X + cs * Y;
+  return { x: X2 / kx, y: Y2 / ky };
+}
+
+/** 中心轨是否带事件层（带层就必须密采样，选哪个公共 anchor 都省不掉这份成本） */
+function hasLayeredCenter(a) {
+  const tr = ((a.tracks || a).centerX) || [];
+  return !!(tr.layers && tr.layers.length > 1);
+}
+
+/** 给合并组挑公共 anchor：让"中心轨能结构直译"的噪域总权重最大（其余改烘焙）。
+ *  weight 只用中心轨事件数（角度/尺寸不需要烘焙）。layered 中心无论怎么选都要密采样 → 权重 0。 */
+function pickGroupAnchor(areas, mode) {
+  const eligible = (a) => anchorModeOf(a) === 'rect' && (mode !== 'world' || !a.parentLine);
+  const weight = (a) => {
+    if (!eligible(a) || hasLayeredCenter(a)) return 0;
+    return (((a.tracks || a).centerX) || []).length + 1;
+  };
+  const round = (v) => Math.round(v * 1e9) / 1e9;
+  const cand = new Map();
+  for (const a of areas) {
+    if (!eligible(a)) continue;
+    const p = effRectAnchor(a);
+    const key = round(p.x) + ',' + round(p.y);
+    let W = 0, total = 0;
+    for (const b of areas) {
+      const pb = effRectAnchor(b);
+      if (round(pb.x) === round(p.x) && round(pb.y) === round(p.y)) W += weight(b);
+      total += weight(b);
+    }
+    cand.set(key, { x: p.x, y: p.y, match: W, cost: total - W });
+  }
+  let best = { x: 0.5, y: 0.5, match: -1, cost: Infinity };
+  for (const v of cand.values()) if (v.cost < best.cost || (v.cost === best.cost && v.match > best.match)) best = v;
+  return { x: best.x, y: best.y };
+}
+
+/** 把一组（时间段互不重叠的）噪域合并成一条判定线 */
+function buildMergedLine(group, ctx) {
+  const areas = group || [];
+  if (!areas.length) return null;
+  const lines = ctx.lines || [], oldToNew = ctx.oldToNew;
+  const chartEnd = ctx.chartEnd;
+  const wins = areas.map(a => areaSpans(a, chartEnd));          // 占用段（几何也覆盖 active，避免"先激活后出现"）
+  // 父线：全部相同才保留，否则世界坐标
+  let fatherOld = null, fatherOk = true;
+  for (const a of areas) {
+    const oi = a.parentLine ? (lines ? lines.indexOf(a.parentLine) : -1) : -1;
+    if (fatherOld === null) fatherOld = oi;
+    else if (fatherOld !== oi) fatherOk = false;
+  }
+  let father = -1;
+  if (fatherOk && fatherOld >= 0) {
+    if (oldToNew && oldToNew.has(fatherOld)) father = oldToNew.get(fatherOld);
+    else fatherOk = false;
+  }
+  // 参数化模式
+  let mode;
+  if (!fatherOk) mode = 'world';
+  else if (!areas.every(a => anchorModeOf(a) === 'rect')) mode = 'local';
+  else {
+    const p0 = effRectAnchor(areas[0]);
+    const same = areas.every(a => { const p = effRectAnchor(a); return Math.abs(p.x - p0.x) < 1e-9 && Math.abs(p.y - p0.y) < 1e-9; });
+    mode = same ? 'struct' : 'local';
+  }
+  if (mode === 'world') father = -1;
+  // 公共 anchor：struct 用组内 anchor；其余模式挑"让最多中心轨保持结构直译"的那个
+  const A = (mode === 'struct') ? effRectAnchor(areas[0]) : pickGroupAnchor(areas, mode);
+  const centerIsStruct = (a) => {
+    if (anchorModeOf(a) !== 'rect') return false;
+    if (mode === 'world' && a.parentLine) return false;
+    const p = effRectAnchor(a);
+    return Math.abs(p.x - A.x) < 1e-9 && Math.abs(p.y - A.y) < 1e-9;
+  };
+  // 中心
+  const mX = [], mY = [];
+  for (let i = 0; i < areas.length; i++) {
+    const a = areas[i], T = a.tracks || a;
+    if (mode === 'struct' || centerIsStruct(a)) {
+      mX.push(...clippedTrackEvents(T.centerX, wins[i], a.bx || 0, v => v, SIMPLIFY_POS));
+      mY.push(...clippedTrackEvents(T.centerY, wins[i], a.by || 0, v => v, SIMPLIFY_POS));
+    } else {
+      const c = denseCenterEvents(a, wins[i], mode === 'world', ctx.aspect, chartEnd, A);
+      mX.push(...c.x); mY.push(...c.y);
+    }
+  }
+  // 尺寸 / 角度：结构轨道（与 anchor/father 无关）
+  const sX = [], sY = [], rot = [];
+  for (let i = 0; i < areas.length; i++) {
+    const T = areas[i].tracks || areas[i];
+    sX.push(...clippedTrackEvents(T.width, wins[i], RPE_WIDTH, v => encScale(v), SIMPLIFY_SCALE));
+    sY.push(...clippedTrackEvents(T.height, wins[i], RPE_HEIGHT, v => encScale(v), SIMPLIFY_SCALE));
+    rot.push(...clippedTrackEvents(T.rotation, wins[i], 0, v => -v, SIMPLIFY_ROT));
+  }
+  // 生命周期：合并 visible/active（同刻 false 在 true 之前 ⇒ 相邻窗口切换时"新窗口生效"）
+  const vis = [], act = [];
+  for (const a of areas) {
+    vis.push(...((a.tracks && a.tracks.visible) || []));
+    act.push(...((a.tracks && a.tracks.active) || []));
+  }
+  const sortB = (arr) => arr.sort((p, q) => p.start - q.start || (p.a ? 1 : 0) - (q.a ? 1 : 0) || p.end - q.end);
+  const speed = lifeToSpeedEvents({ visible: sortB(vis), active: sortB(act) }, chartEnd);
+  if (!speed.length) return null;
+  const anchor = A;
+  const a0 = areas[0];
+  return makeNoiseLine({
+    mX, mY, sX, sY, rot, speed,
+    anchor: [anchor.x, anchor.y], father,
+    subtract: a0.subtract, index: ctx.index, chartEnd,
+    defX: a0.bx || 0, defY: a0.by || 0,
+  });
 }
 
 /** 把 S.areas 反向写成 RPE 判定线，合并进一份 RPE 谱面（原噪域线全部替换）。
  *  · 源谱里旧的 Line2Area 线（Texture=isSubtract*）先删掉 → 用当前噪域重建；
  *  · 删行会让下标位移，所以保留下来的判定线要**重映射 father**；
- *  · 噪域的父线若指向被删掉的噪域线 → 这条噪域改走烘焙（father=-1，世界坐标）。
- *  返回新对象（不改入参 doc）。 */
+ *  · 噪域的父线若指向被删掉的噪域线 → 这条噪域改走烘焙（father=-1，世界坐标）；
+ *  · 默认按"时间段互不重叠"把噪域装箱合并（opts.merge=false 可关闭，一条噪域一条线）。 */
 function rpeWithNoiseLines(doc, lines, areas, opts) {
   const o = opts || {};
   const src = (doc && doc.judgeLineList) || [];
@@ -2533,17 +3056,26 @@ function rpeWithNoiseLines(doc, lines, areas, opts) {
     const nf = (f >= 0 && oldToNew.has(f)) ? oldToNew.get(f) : -1;
     return (nf === f) ? L : Object.assign({}, L, { father: nf });
   });
-  (areas || []).forEach((a, ai) => {
-    let father = -1, forceBake = false;
-    if (a && a.parentLine) {
-      const oi = lines ? lines.indexOf(a.parentLine) : -1;
-      if (oi >= 0 && oldToNew.has(oi)) father = oldToNew.get(oi);
-      else forceBake = true;                          // 父线不在保留列表（或是被重建的噪域线）→ 烘焙
+  const chartEnd = (isFinite(o.chartEnd) && o.chartEnd > 0) ? o.chartEnd : 1e6;
+  const ctx = { lines, oldToNew, chartEnd, aspect: o.aspect };
+  const groups = (o.merge === false)
+    ? (areas || []).map(a => [a])
+    : packNoiseAreas(areas, chartEnd).map(g => g.areas);
+  groups.forEach((g, gi) => {
+    if (!g.length) return;
+    let ln;
+    if (g.length === 1) {
+      const a = g[0];
+      let father = -1, forceBake = false;
+      if (a && a.parentLine) {
+        const oi = lines ? lines.indexOf(a.parentLine) : -1;
+        if (oi >= 0 && oldToNew.has(oi)) father = oldToNew.get(oi);
+        else forceBake = true;
+      }
+      ln = areaToRecorderLine(a, { father, forceBake, index: gi, chartEnd, aspect: o.aspect });
+    } else {
+      ln = buildMergedLine(g, Object.assign({ index: gi }, ctx));
     }
-    const ln = areaToRecorderLine(a, {
-      father, forceBake, index: ai,
-      chartEnd: o.chartEnd, aspect: o.aspect,
-    });
     if (ln) outLines.push(ln);
   });
   return Object.assign({}, doc, { judgeLineList: outLines });
@@ -3514,7 +4046,8 @@ const CORE = {
   overlayEvents,
   lineStateAt,
   pezInfoTxt,
-  recorderSubtractOf, recorderLifeCycle, recorderLineToArea, areaToRecorderLine, rpeWithNoiseLines, HEIGHT_RATIO, SPEED_RATIO_RPE, FADEOUT_TIME, ABOVE_SIGN, NOTE_WIDTH_RATIO_BASE, NOTE_W_RPE, kRpePerBeat, lineEvents, buildLines, buildFloor, floorAt,
+  recorderSubtractOf, recorderLifeCycle, recorderLineToArea, areaToRecorderLine, rpeWithNoiseLines,
+ packNoiseAreas, packLowerBound, areaSpans, HEIGHT_RATIO, SPEED_RATIO_RPE, FADEOUT_TIME, ABOVE_SIGN, NOTE_WIDTH_RATIO_BASE, NOTE_W_RPE, kRpePerBeat, lineEvents, buildLines, buildFloor, floorAt,
   kRpeFactor, isMultiBpm, bpmAt, floorTimeBetween,
 };
 /* ============================================================================
@@ -3770,7 +4303,7 @@ function exportRpe() {
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
   status(`已导出 ${S.areas.length} 个噪域`
-    + (S.rpeNoiseLines ? `（含 ${rpeNoiseLineCount(obj)} 条 Line2Area 判定线）` : ''), 4000);
+    + (S.rpeNoiseLines ? ` → ${rpeNoiseLineCount(obj)} 条 Line2Area 判定线（时间不重叠的已合并）` : ''), 4000);
 }
 
 function computeTotal() {
@@ -6993,7 +7526,7 @@ async function writeToRpeDir() {
     await w.close();
   } catch (e) { return status('写入失败：' + e.message, 5000); }
   status('已写回 ' + target + '（' + S.areas.length + ' 个噪域，官方 blockAreaList'
-    + (S.rpeNoiseLines ? ' + ' + rpeNoiseLineCount(obj) + ' 条 Line2Area 判定线' : '') + '）', 8000);
+    + (S.rpeNoiseLines ? ' + ' + rpeNoiseLineCount(obj) + ' 条 Line2Area 判定线（合并后）' : '') + '）', 8000);
 }
 
 /* ---------- 仅导出噪域数据：官方格式 blockAreaList.json ----------
