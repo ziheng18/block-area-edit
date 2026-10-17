@@ -2324,21 +2324,52 @@ function sumLayerEvents(groups, def) {
    anchor 与角点用同一套百分比坐标。
    ==================================================================== */
 function toOfficial(areas, bpm, aspect, chartEnd) {
-  // ★ 多周期的噪域【拆成多个噪域】再导出：
-  //   官方格式每个噪域只有一组 appear/enable/disable/disappear，多周期表达不了。
-  //   按 visible 的每个 true 区间切成一条，几何用窗口两端的精确值（evalNum）线性表示。
+  // ★ 多周期 / 多次生效的噪域【拆成多个噪域】再导出：
+  //   官方格式每个噪域只有一组 appear/enable/disable/disappear（单可见周期 + 单生效区间），
+  //   而编辑器允许 visible / active 各自多次开关。于是分两级拆：
+  //     ① 按 visible 的 true 区间拆（每个可见周期一条）—— 原先就有；
+  //     ② 同一可见窗口内若有多段 active，再在【第 2..N 段生效的起点】处继续拆，
+  //        appear/disappear 首尾相接、enable/disable 各自独立。
+  //   不拆的话，窗口内多段生效会被并集成一整段（中间的停用段被错误地填成生效）。
   const out = [];
-  for (const a of (areas || [])) {
-    const vis = (a.tracks && a.tracks.visible) || [];
-    const spans = [];
-    let cur = null;
-    for (const e of vis) {
-      if (e.a && !cur) cur = e.start;
+  const trueSpans = (track) => {
+    const spans = []; let cur = null;
+    for (const e of (track || [])) {
+      if (e.a && cur == null) cur = e.start;
       if (!e.a && cur != null) { spans.push([cur, e.start]); cur = null; }
     }
     if (cur != null) spans.push([cur, Infinity]);
-    if (spans.length <= 1) { out.push.apply(out, toOfficialOne([a], bpm, null, aspect, chartEnd)); continue; }
-    for (const sp of spans) out.push.apply(out, toOfficialOne([a], bpm, sp, aspect, chartEnd));
+    return spans;
+  };
+  for (const a of (areas || [])) {
+    const T = (a && a.tracks) || a || {};
+    const spans = trueSpans(T.visible);
+    const actSpans = trueSpans(T.active);
+    /** 把 [lo,hi] 按窗口内第 2..N 段生效的起点切开（无多段时返回原窗口本身） */
+    const splitByActive = (lo, hi) => {
+      const hit = actSpans.filter(sp => sp[1] > lo + 1e-9 && sp[0] < hi - 1e-9);
+      if (hit.length <= 1) return [[lo, hi]];
+      const cuts = [];
+      for (let i = 1; i < hit.length; i++) {
+        const t = hit[i][0];
+        if (t > lo + 1e-9 && t < hi - 1e-9 && (!cuts.length || t > cuts[cuts.length - 1] + 1e-9)) cuts.push(t);
+      }
+      if (!cuts.length) return [[lo, hi]];
+      const wins = []; let s = lo;
+      for (const c of cuts) { wins.push([s, c]); s = c; }
+      wins.push([s, hi]);
+      return wins;
+    };
+    if (spans.length <= 1) {
+      // ★ 单可见周期：没有多段生效时保持 win = null（旧的"整条生命周期"路径，
+      //   官方来源才能走原值还原）；有多段生效才改用显式窗口拆条。
+      const sp = spans.length ? spans[0] : null;
+      const wins = sp ? splitByActive(sp[0], sp[1]) : [];
+      if (wins.length <= 1) { out.push.apply(out, toOfficialOne([a], bpm, null, aspect, chartEnd)); continue; }
+      for (const w of wins) out.push.apply(out, toOfficialOne([a], bpm, w, aspect, chartEnd));
+      continue;
+    }
+    for (const sp of spans) for (const w of splitByActive(sp[0], sp[1])) out.push.apply(out, toOfficialOne([a], bpm, w, aspect, chartEnd));
   }
   return out;
 }
@@ -2660,11 +2691,17 @@ function toOfficialOne(areas, bpm, win, aspect, chartEnd) {
     //    · 带父线的（只可能是 Recorder 来源）：父线复合官方格式没有 → 也走全烘。
     //    这条路上"烘进去的差额"恰好就是【中心轨本身】（因为 abs 的渲染中心 = 轨道值 + 链位移），
     //    所以网格不必再并进 宽/高/角度（省下大量关键帧），而 anchor 保住真实枢轴。
-    const fromAbs = !fromOff && !a.lockAnchor && !a.parentLine && anchorModeOf(a) === 'abs';
+    // ★★ 但【被拆出来的窗口】例外（win != null）：官方链在每个条目里都从 0 重新开始，
+    //    而编辑器里链状态是跨事件累计的（δ 从块的首个旋转事件算起）。直接沿用真实 anchor 时，
+    //    第 2+ 个条目（以及窗口起点晚于块起点的第 1 个条目）会丢掉窗口起点处已有的位移
+    //    （实测 abs+偏心 anchor+双窗口：中心偏 400 = 2|a|）。所以拆窗口时改走"烘焙位移 +
+    //    中性 anchor"，渲染才对得上（牺牲这几个条目的 anchor 参数化，换正确几何）。
+    const bakeForWin = !!win && !neutralOff && !a.lockAnchor;
+    const fromAbs = !fromOff && !a.lockAnchor && !a.parentLine && anchorModeOf(a) === 'abs' && !bakeForWin;
     // ★ 几何是否必须【重新密采样】：官方来源且仍按官方链求值 → 原关键帧就够（保住缓动编号）；
-    //   其余（含官方源切 rect）都要把 d 烘进几何 ⇒ 走密集线性关键帧。
+    //   其余（含官方源切 rect / 被拆窗口）都要把 d 烘进几何 ⇒ 走密集线性关键帧。
     //   官方源切【简单模式】时 d ≡ 0，原关键帧仍然成立 ⇒ 只换中性 anchor，几何不重采。
-    const denseGeom = !fromOff || (neutralOff && !a.lockAnchor);
+    const denseGeom = !fromOff || (neutralOff && !a.lockAnchor) || bakeForWin;
     // ★ 不取反：噪域线的 centerX 轨道值本身就是官方格式要的坐标。
     //   镜像发生在【锚点位移】上（anchorDisp 里 X = -ax·sx·kx），不是发生在轨道值上。
     //   实测：源 centerX=-400 / 导回=+400 就是这里多取了一次反。
@@ -2882,8 +2919,10 @@ function toOfficialOne(areas, bpm, win, aspect, chartEnd) {
     const rt = (!win && a.recTimes && (!a.recLifeSig || a.recLifeSig === lifeSig(T))) ? a.recTimes : null;
     const rb = (!win && a.recBox && (!a.recBoxSig || a.recBoxSig === ((a.bx || 0) + ',' + (a.by || 0) + ',' + a.boxW + ',' + a.boxH))) ? a.recBox : null;
     // ★ 窗口内的四个时间点：必须落在 [窗口起点, 窗口结束] 内，且 disable >= enable。
-    //   enable/disable 取【与窗口相交的生效区间】的并集端点（官方格式一条只有一个生效区间，
-    //   窗口内若有多个生效突发，只能用并集近似 —— 但绝不能像原先那样从窗口起点就开始生效）。
+    //   enable/disable 取【与窗口相交的生效区间】的端点。
+    //   ★ 调用方 toOfficial 已经保证：一个传入窗口内至多只有一段 active（多段会在
+    //     后几段的起点处先拆条）⇒ 这里取的是唯一那段；下方的并集逻辑只是兜底。
+    //   绝不能像原先那样从窗口起点就开始生效。
     const wApp = win ? win[0] : appear;
     const wEnd = lifeEndFixed != null ? lifeEndFixed : ((win || visUnclosed) ? tEnd : disappear);
     let wEn, wDi;
