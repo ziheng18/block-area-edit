@@ -266,12 +266,14 @@
       · 预览画面里拖拽 = 改当前值位置/边长，再点右侧 <b>⟲ 同步</b> 写入事件</p>
     <div class="btns"><button onclick="document.getElementById('dlgHelp').close()">关闭</button></div>
   </div>
+</dialog>
+
 <dialog id="dlgVariant">
   <h2>官方格式不支持这些「变格功能」</h2>
   <div class="dbody">
-    <div>当前谱面包含以下官方谱面格式**无法表达、也无法通过拟合解决**的功能：</div>
+    <div>当前谱面包含以下官方谱面格式<b>无法表达、也无法通过拟合解决</b>的功能：</div>
     <ul id="variantList" style="margin:8px 0 10px;padding-left:20px;line-height:1.9"></ul>
-    <div>继续导出会<strong>去掉上述功能</strong>后再生成官方谱面（原编辑器内的数据不受影响，随时可再改回 RPE 导出）。</div>
+    <div>继续导出会<b>去掉上述功能</b>后再生成官方谱面（原编辑器内的数据不受影响，随时可再改回 RPE 导出）。</div>
     <div class="btns" style="justify-content:flex-end;margin-top:12px">
       <button id="btnVariantCancel">取消</button>
       <button id="btnVariantOk" class="pri">去掉后导出</button>
@@ -8596,27 +8598,65 @@ function officialVariantFeatures() {
   }
   return list;
 }
-/** 生成"去掉变格功能"后的噪域副本：颜色轨清空（官方格式颜色恒为默认红）。 */
+/** 深拷贝一条事件轨（保留 .layers，颜色数组也复制）。导出剥离功能时用，
+ *  保证 `CORE.toOfficial()` 即使内部对数组/事件做了任何处理，也绝不会碰到编辑器内的原数据。 */
+function cloneTrackForExport(tr) {
+  const src = tr || [];
+  const cp = src.map(e => {
+    const ec = Object.assign({}, e);
+    if (Array.isArray(e && e.a)) ec.a = CORE.colorCopy(e.a);
+    if (Array.isArray(e && e.b)) ec.b = CORE.colorCopy(e.b);
+    return ec;
+  });
+  if (src.layers) cp.layers = src.layers.map(g => (g || []).map(e => {
+    const ec = Object.assign({}, e);
+    if (Array.isArray(e && e.a)) ec.a = CORE.colorCopy(e.a);
+    if (Array.isArray(e && e.b)) ec.b = CORE.colorCopy(e.b);
+    return ec;
+  }));
+  return cp;
+}
+/** 深拷贝噪域（tracks 全量复制） */
+function cloneAreaForExport(a) {
+  const cp = Object.assign({}, a);
+  const src = (a && a.tracks) || {};
+  cp.tracks = {};
+  for (const k of Object.keys(src)) cp.tracks[k] = cloneTrackForExport(src[k]);
+  return cp;
+}
+/** 生成"去掉变格功能"后的噪域**副本**：颜色轨清空（官方格式颜色恒为默认红）。
+ *  ★ 必须是深拷贝：导出过程哪怕修改了副本里的数组/事件，编辑器里的 S.areas 也完全不受影响。 */
 function stripVariantAreas(areas) {
   return (areas || []).map(a => {
-    const cp = Object.assign({}, a);
-    cp.tracks = Object.assign({}, (a && a.tracks) || {});
+    const cp = cloneAreaForExport(a);
     cp.tracks.color = [];
     return cp;
   });
 }
-/** 变格功能确认框：返回 Promise<boolean>（true=去掉后继续导出，false=取消）。 */
+/** 变格功能确认框：返回 Promise<boolean>（true=去掉后继续导出，false=取消）。
+ *  ★ 对话框若打不开（浏览器限制/结构异常）不能静默导出 —— 退回原生 confirm；再失败就取消。 */
 function confirmOfficialVariants(features) {
+  const msg = '官方格式不支持以下「变格功能」：\n\n' +
+    (features || []).map(f => '· ' + f.label).join('\n') +
+    '\n\n继续导出会去掉这些功能后再生成官方谱面（编辑器内数据不受影响）。是否继续？';
   return new Promise((resolve) => {
     const dlg = $('dlgVariant'), listEl = $('variantList');
-    if (!dlg || !listEl) return resolve(true);           // 无对话框时退回直接导出
+    if (!dlg || !listEl || typeof dlg.showModal !== 'function') {
+      return resolve(typeof window.confirm === 'function' ? !!window.confirm(msg) : false);
+    }
     listEl.innerHTML = (features || []).map(f => '<li>' + f.label + '</li>').join('');
     let done = false;
-    const finish = (v) => { if (done) return; done = true; try { dlg.close(); } catch (e) { } resolve(v); };
+    const finish = (v) => { if (done) return; done = true; try { if (dlg.open) dlg.close(); } catch (e) { } resolve(v); };
     $('btnVariantOk').onclick = () => finish(true);
     $('btnVariantCancel').onclick = () => finish(false);
     dlg.oncancel = (e) => { e.preventDefault(); finish(false); };
-    try { dlg.showModal(); } catch (e) { finish(true); }
+    try {
+      if (dlg.open) dlg.close();
+      dlg.showModal();
+    } catch (e) {
+      try { dlg.close(); } catch (e2) { }
+      finish(typeof window.confirm === 'function' ? !!window.confirm(msg) : false);
+    }
   });
 }
 /** 导出官方前统一走一遍：有变格功能 → 弹窗确认 → 返回用于导出的 areas 与提示文本。 */
