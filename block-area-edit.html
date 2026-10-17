@@ -8070,7 +8070,8 @@ function exportAreaList() {
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
   status('已导出【标准官谱格式（无判定线）】：formatVersion ' + doc.formatVersion + ' / offset ' + doc.offset
-    + ' / judgeLineList [] / blockAreaList ' + list.length + ' 个噪域', 6000);
+    + ' / judgeLineList [] / blockAreaList ' + list.length + ' 个噪域'
+    + (CORE.areasHaveColor(S.areas) ? '；⚠ 标准官谱格式没有颜色字段：彩色噪域颜色已丢弃（要保留请用「导出 RPE + RPE 含噪域线」）' : ''), 7000);
 }
 
 /* ---------- 导出 RPE 格式 pez（无噪域判定线）----------
@@ -8556,7 +8557,8 @@ async function exportPez() {
       : ((isFinite(audio.duration) && audio.duration > 0) ? audio.duration : (S.total || 0)),
   })) });
   download(await zipBuild(files), (m.name || id) + '.pez');
-  status('已导出 .pez：' + files.length + ' 个文件（谱面 + 音乐 + 插图 + info.txt）', 5000);
+  status('已导出 .pez：' + files.length + ' 个文件（谱面 + 音乐 + 插图 + info.txt）'
+    + (CORE.areasHaveColor(S.areas) ? '；⚠ 官方 pez 无法表达彩色噪域：颜色已丢弃（要保留请用「导出 RPE」并勾选「RPE 含噪域线」）' : ''), 7000);
 }
 
 document.getElementById('cpAll').onclick = () => { S.areas.forEach((a2, i) => { if (i !== S.sel) cpSel.add(i); }); cpRender(); };
