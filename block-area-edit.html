@@ -165,6 +165,7 @@
     <button id="btnExpAreaList" title="仅导出噪域数据：**标准官谱结构**（formatVersion/offset/judgeLineList:[]/blockAreaList），文件名 blockAreaList.json —— RPE Recorder 原生适配官谱噪域">仅导出噪域数据</button>
     <button id="btnExpRpePez" title="导出 RPE 格式 pez（含 blockAreaList，但去掉所有噪域判定线，不带噪域贴图）">导出 RPE pez（无噪域线）</button>
     <button id="btnWriteDir" title="选择 RPE 谱面目录，直接写回其中的谱面 json">写回 RPE 目录</button>
+    <label class="chk" id="lblRpeLines" title="勾选后：导出 RPE / 写回 RPE 目录时，把噪域写成 Line2Area 判定线（Texture=isSubtract0/1.png、生命周期走 speed 道、anchor 为贴图归一化支点）。默认关闭。"><input type="checkbox" id="chkRpeLines"> RPE 含噪域线</label>
     <label class="chk" title="勾选后：预览拖拽/改值【立即写入事件】，不再需要点 ⟲（是否出现/是否生效不受影响）"><input type="checkbox" id="chkLive"> 即时修改</label>
     <label class="chk" id="lblImgCols" title="横向网格数，越大越细">精细度 <input type="number" id="imgCols" value="48" min="8" max="200" step="8" style="width:52px"></label>
   <span class="sep"></span>
@@ -2228,6 +2229,326 @@ function recorderLineToArea(L, allLines) {
   return a2;
 }
 
+/* ==================== 内部噪域 → RPE Line2Area 判定线（recorderLineToArea 的逆） ====================
+   RPE 格式没有噪域字段，全靠约定：一条普通判定线（Texture = isSubtract0/1.png）
+   + move/scale/rotate 给几何 + 速度道取值 1/2/3/4 给生命周期 + anchor 给贴图归一化支点。
+   ★ 反向映射分两条路：
+     · rect（Recorder/Line2Area 的原生模型）：**结构直译** —— 往返无损，导回 RPE 还能继续编辑；
+     · abs / 简单模式 / 带事件层 / 含官方 Zero-One(30/31) 缓动：单支点表达不了逐事件锚点，
+       把【渲染后的世界中心 + 尺寸 + 角度】密集采样成线性关键帧，anchor 写中心、father=-1
+       （渲染等价；代价是这几条线的参数化变成烘焙点）。
+   ============================================================================ */
+
+/** 内部 beat → RPE 三元组（分母 480 覆盖 1/32 拍与常见切分；bestTriple 取最简精确表示） */
+function beatTriple(t) { return bestTriple(Math.max(0, +t || 0), 480); }
+
+/** RPE 事件对象。Line2Area 只需要 RPE 播放器能解析的字段；easing 30/31 是内部
+ *  「官方 Zero/One」的载体，不是 RPE 的 30/31 ⇒ 调用方应先走烘焙路径，这里兜底写线性。 */
+function mkRpeEv(t0, t1, v0, v1, easing, extra) {
+  const ez = (easing >= 1 && easing <= 29) ? easing : 1;
+  return Object.assign({
+    startTime: beatTriple(t0), endTime: beatTriple(t1),
+    start: v0, end: v1,
+    easingType: ez,
+    bezier: 0, bezierPoints: [0, 0, 0, 0], easingLeft: 0, easingRight: 1, linkgroup: 0,
+  }, extra || {});
+}
+
+/** 内部宽高（RPE 单位）→ extended.scaleX/Y 取值：
+ *  Recorder 读取时 |v|<=20 视为"相对 900 的倍率"、>20 视为绝对长度（见 recorderLineToArea 的 asLen）——
+ *  这里选不会被误判的那种写法（倍率 ≤20 就用倍率，否则直接写长度）。 */
+function encScale(v) {
+  const av = Math.abs(+v || 0);
+  const m = av / RPE_HEIGHT;
+  return m <= 20 ? m : av;
+}
+
+/** visible/active 布尔轨 → 速度道生命周期事件（1 出现 / 2 激活 / 3 失活 / 4 消失）。
+ *  多次开关逐段写；首个变化晚于 0 拍时补 10（初始化）。返回的顺序即时间顺序。 */
+function lifeToSpeedEvents(T, chartEnd) {
+  const ts = new Set();
+  for (const e of (T.visible || [])) for (const t of [e.start, e.end]) if (isFinite(t)) ts.add(+Math.max(0, t).toFixed(9));
+  for (const e of (T.active || [])) for (const t of [e.start, e.end]) if (isFinite(t)) ts.add(+Math.max(0, t).toFixed(9));
+  if (!ts.size) return [];
+  const times = [...ts].sort((x, y) => x - y);
+  const changes = [];
+  let curV = false, curA = false;
+  for (const t of times) {
+    const v = evalBool(T.visible, t, false), a = evalBool(T.active, t, false);
+    if (v === curV && a === curA) continue;
+    // 状态迁移 → 约定取值（2 同时隐含"已出现"；4 同时隐含"已失活"）
+    const val = !v ? 4 : (a ? 2 : (curA ? 3 : 1));
+    changes.push({ t, v: val });
+    curV = v; curA = a;
+  }
+  if (!changes.length) return [];
+  if (changes[0].t > 1e-9) changes.unshift({ t: 0, v: 10 });      // 0 拍初始化
+  const out = [];
+  for (let i = 0; i < changes.length; i++) {
+    const t0 = changes[i].t;
+    let t1 = (i + 1 < changes.length) ? changes[i + 1].t
+           : (isFinite(chartEnd) && chartEnd > t0 + 1e-9 ? chartEnd : t0 + 1);
+    if (!(t1 > t0)) t1 = t0 + 1;
+    out.push(mkRpeEv(t0, t1, changes[i].v, changes[i].v, 1));
+  }
+  return out;
+}
+
+/** 内部事件轨 → RPE 事件数组（结构直译用）。conv 负责单位/符号换算，def 是该轨在
+ *  「首个事件之前」的求值默认值（与 areaState 一致：中心=bx/by、宽=1350、高=900、旋转=0）。
+ *  ★★ RPE 事件必须满足：startTime < endTime（无零长），且同轨内互不重叠。
+ *   内部轨却可能有【零长事件 / 重叠事件】（用户编辑、合成数据、Recorder 源的负时间初始化事件），
+ *   所以这里按【所有事件的 start/end 断点】重写整条轨：
+ *     · 段恰好等于某个源事件的完整区间 → 原样保留缓动/贝塞尔/切割（逐位还原）；
+ *     · 段被断点切开（重叠、零长、负时间） → 用有效求值细分线性（K=16）逼近；
+ *     · 空档 / 跨事件边界 → 线性（相当于 RPE 的"保持"）。
+ *   零长事件于是自然变成"t 处的一次跳变"：前一段在 t 结束、后一段从 t 开始，不会写出零长段。 */
+function trackToRpe(track, conv, def, tEnd) {
+  const src = (track || []).slice().sort((p, q) => p.start - q.start);
+  const out = [];
+  const defVal = (def == null ? 0 : def);
+  const toVal = (v) => conv(v == null ? defVal : v);
+  const EPS = 1e-9;
+  if (!src.length) return out;
+  // 断点：0 起（RPE 事件从 0 开始），加上所有 >=0 的 start/end；负时间抬到 0 处理
+  const ts = new Set([0]);
+  for (const e of src) {
+    for (const t of [e.start, e.end]) if (isFinite(t) && t > 0) ts.add(+t.toFixed(9));
+  }
+  const times = [...ts].sort((a, b) => a - b);
+  const pushEv = (t0, t1, v0, v1, ez, extra) => {
+    if (!(t1 > t0 + EPS)) return;                         // 零长/负长：不写
+    out.push(mkRpeEv(t0, t1, toVal(v0), toVal(v1), ez, extra));
+  };
+  for (let i = 0; i + 1 < times.length; i++) {
+    const t0 = times[i], t1 = times[i + 1];
+    if (!(t1 > t0 + EPS)) continue;
+    const mid = (t0 + t1) / 2;
+    const idx = lastStartLE(src, mid);
+    const e = idx >= 0 ? src[idx] : null;
+    const valR = (t) => evalNum(src, t, defVal);                       // 右极限（t 处新事件生效）
+    const valL = (t) => evalNum(src, Math.max(t0, t - 1e-9), defVal);  // 左极限（段末只取到 t1⁻）
+    const whole = !!e && e.start <= t0 + EPS && e.end >= t1 - EPS;
+    const exact = whole && Math.abs(e.start - t0) <= EPS && Math.abs(e.end - t1) <= EPS;
+    if (exact) {
+      const extra = {
+        easingLeft: (e.ezL == null ? 0 : e.ezL),
+        easingRight: (e.ezR == null ? 1 : e.ezR),
+      };
+      if (e.bez && e.bez.length === 4) { extra.bezier = 1; extra.bezierPoints = e.bez.slice(); }
+      // 用源事件的 a/b（而不是端点求值）：保留缓动曲线本身
+      pushEv(t0, t1, e.a == null ? defVal : e.a, e.b == null ? defVal : e.b, e.easing, extra);
+    } else if (whole) {
+      // 被别的断点切开的缓动段：单段缓动表达不了剩余曲线 → 细分线性
+      const K = 16;
+      for (let k = 0; k < K; k++) {
+        const a = t0 + (t1 - t0) * k / K, b = t0 + (t1 - t0) * (k + 1) / K;
+        pushEv(a, b, valR(a), valL(b), 1, null);
+      }
+    } else {
+      // 空档 / 跳变边界：起点右极限 → 终点左极限（这样 b_prev ≠ a_next 的阶跃不会变成斜坡）
+      pushEv(t0, t1, valR(t0), valL(t1), 1, null);
+    }
+  }
+  // ★ 尾部：最后一个断点之后还要写一段"保持当前有效值"——
+  //   否则末尾的【零长事件】所表达的阶跃会丢（前一段的 end 仍是跳变前的值，RPE 会一直保持它）。
+  //   同时也是所有轨道的收尾（RPE 事件列表不以 0 时长结尾，段长 = 到谱面末端）。
+  {
+    const lastT = times.length ? times[times.length - 1] : 0;
+    const tailEnd = (isFinite(tEnd) && tEnd > lastT + EPS) ? tEnd : lastT + 1;
+    const v = evalNum(src, lastT, defVal);
+    pushEv(lastT, tailEnd, v, v, 1, null);
+  }
+  return out;
+}
+
+/** 事件数组的兜底校验：丢掉零长/负长段；若出现重叠（正常构造不会发生）则丢掉该段，
+ *  由 RPE 的"保持上一段终值"补上空档。保证每条轨严格递增、互不重叠、段长 > 0。 */
+function sanitizeRpeEvents(evs) {
+  const sorted = (evs || []).slice().sort((p, q) => tripleToBeats(p.startTime) - tripleToBeats(q.startTime));
+  const out = [];
+  let lastEnd = -Infinity;
+  for (const e of sorted) {
+    const t0 = tripleToBeats(e.startTime), t1 = tripleToBeats(e.endTime);
+    if (!(t1 > t0 + 1e-9)) continue;              // 零长 / 负长：不写
+    if (t0 < lastEnd - 1e-9) continue;            // 重叠：丢掉本段
+    out.push(e);
+    lastEnd = t1;
+  }
+  return out;
+}
+
+/** 结构直译是否成立：rect 模式 + 无事件层 + 无官方 Zero-One(30/31) 缓动 + 未强制烘焙。 */
+function canStructLine(a, forceBake) {
+  if (!a || forceBake || anchorModeOf(a) !== 'rect') return false;
+  const T = a.tracks || a;
+  for (const k of ['centerX', 'centerY', 'width', 'height', 'rotation']) {
+    const tr = T[k] || [];
+    if (tr.layers && tr.layers.length > 1) return false;
+    for (const e of tr) if (e.easing === 30 || e.easing === 31) return false;
+  }
+  return true;
+}
+
+/** 烘焙路径：把渲染后的世界中心/尺寸/角度密集采样成线性关键帧。
+ *  用 areaState（含父线复合、锚点位移、事件层求和）⇒ 目标端 anchor=中心、father=-1 即可复现。 */
+function bakeLineTracks(a, aspect, chartEnd) {
+  const T = a.tracks || a;
+  let t0 = Infinity, t1 = -Infinity;
+  for (const e of (T.visible || [])) if (e.a) t0 = Math.min(t0, e.start);
+  for (const k of ['centerX', 'centerY', 'width', 'height', 'rotation']) for (const e of (T[k] || [])) {
+    if (isFinite(e.start)) { t0 = Math.min(t0, e.start); t1 = Math.max(t1, e.start); }
+    if (isFinite(e.end)) t1 = Math.max(t1, e.end);
+  }
+  for (const e of (T.visible || [])) if (isFinite(e.end)) t1 = Math.max(t1, e.end);
+  if (!isFinite(t0)) t0 = 0;
+  const cEnd = (isFinite(chartEnd) && chartEnd > t0 + 1e-9) ? chartEnd : t0 + 1;
+  if (!isFinite(t1) || t1 <= t0) t1 = cEnd;
+  t1 = Math.min(t1, cEnd);
+  if (!(t1 > t0)) t1 = t0 + 1;
+  const specs = [
+    { tr: T.centerX, delta: POS_SUB_UNITS }, { tr: T.centerY, delta: POS_SUB_UNITS },
+    { tr: T.width, delta: POS_SUB_UNITS }, { tr: T.height, delta: POS_SUB_UNITS },
+    { tr: T.rotation, delta: ROT_SUB_DEG },
+  ];
+  let p = a.parentLine, depth = 0;
+  while (p && depth++ < 16) {                       // 父线链的动画也要进网格，否则复合轨迹会被漏采
+    specs.push({ tr: (p.ev && p.ev.x) || [], delta: POS_SUB_UNITS },
+               { tr: (p.ev && p.ev.y) || [], delta: POS_SUB_UNITS },
+               { tr: (p.ev && p.ev.rot) || [], delta: ROT_SUB_DEG });
+    p = p.parentLine;
+  }
+  const grid = denseGridTimes(t0, t1, specs, null);
+  // ★ 跳变保护：父线/中心轨的阶跃若只落在网格点上，会被线性插值成跨整段的斜坡
+  //   （实测 4 拍斜坡 ⇒ 中心差 877）。stepGuard 在跳变前 1e-4 拍补"保持左极限"的关键帧。
+  const valFn = (t) => {
+    const st = areaState(a, t, aspect, null);
+    return [st.centerX, st.centerY, st.width, st.height, -st.rotation];
+  };
+  const keys = stepGuard(grid, valFn);
+  const moveX = [], moveY = [], scaleX = [], scaleY = [], rotate = [];
+  let prev = null;
+  for (const kf of keys) {
+    const v = kf.v;
+    const cur = { t: kf.t, x: v[0], y: v[1], w: encScale(v[2]), h: encScale(v[3]), r: v[4] };
+    if (prev && cur.t > prev.t + 1e-12) {
+      moveX.push(mkRpeEv(prev.t, cur.t, prev.x, cur.x, 1));
+      moveY.push(mkRpeEv(prev.t, cur.t, prev.y, cur.y, 1));
+      scaleX.push(mkRpeEv(prev.t, cur.t, prev.w, cur.w, 1));
+      scaleY.push(mkRpeEv(prev.t, cur.t, prev.h, cur.h, 1));
+      rotate.push(mkRpeEv(prev.t, cur.t, prev.r, cur.r, 1));
+    }
+    prev = cur;
+  }
+  return { moveX, moveY, scaleX, scaleY, rotate };
+}
+
+/** 内部噪域 → RPE 判定线对象（供 rpeWithNoiseLines 追加到 judgeLineList）。
+ *  @param a     内部噪域
+ *  @param opts  { father, forceBake, chartEnd, aspect, index }
+ *  @returns RPE line object；没有任何可见段时返回 null */
+function areaToRecorderLine(a, opts) {
+  if (!a) return null;
+  const o = opts || {};
+  const T = a.tracks || a;
+  const speed = lifeToSpeedEvents(T, o.chartEnd);
+  if (!speed.length) return null;                     // 从未出现 → 没有可导出的生命周期
+  let father = (o.father == null ? -1 : o.father);
+  let mX, mY, sX, sY, rot, anchor = [0.5, 0.5];
+  if (canStructLine(a, o.forceBake)) {
+    mX = trackToRpe(T.centerX, v => v, a.bx || 0, o.chartEnd);
+    mY = trackToRpe(T.centerY, v => v, a.by || 0, o.chartEnd);
+    sX = trackToRpe(T.width, v => encScale(v), RPE_WIDTH, o.chartEnd);
+    sY = trackToRpe(T.height, v => encScale(v), RPE_HEIGHT, o.chartEnd);
+    rot = trackToRpe(T.rotation, v => -v, 0, o.chartEnd);   // RPE 的旋转与内部相反（buildLines 里 ×(-1)）
+    if (!a.lockAnchor) {
+      const stR = storedRectAnchor(a);
+      if (stR) {
+        const b = baseSizeOf(a);
+        const p = anchorToRectPivot(stR.ax, stR.ay, b.w, b.h);
+        anchor = [p.x, p.y];
+      }
+    }
+  } else {
+    const baked = bakeLineTracks(a, o.aspect, o.chartEnd);
+    mX = baked.moveX; mY = baked.moveY; sX = baked.scaleX; sY = baked.scaleY; rot = baked.rotate;
+    father = -1;                                      // 烘焙的是世界坐标 ⇒ 不再挂父线
+  }
+  const tEndFallback = (isFinite(o.chartEnd) && o.chartEnd > 0) ? o.chartEnd : 1;
+  const one = (v) => [{ startTime: beatTriple(0), endTime: beatTriple(tEndFallback),
+                        start: v, end: v, easingType: 1, bezier: 0, bezierPoints: [0, 0, 0, 0],
+                        easingLeft: 0, easingRight: 1, linkgroup: 0 }];
+  // ★ 兜底默认值与 areaState 一致：中心=bx/by、宽=RPE_WIDTH、高=RPE_HEIGHT、旋转=0
+  if (!mX.length) mX = one(a.bx || 0);
+  if (!mY.length) mY = one(a.by || 0);
+  if (!rot.length) rot = one(0);
+  if (!sX.length) sX = one(encScale(RPE_WIDTH));
+  if (!sY.length) sY = one(encScale(RPE_HEIGHT));
+  // ★ 最终校验：零长/负长/重叠一律不写（RPE 事件必须是"严格递增、互不重叠、段长>0"）
+  mX = sanitizeRpeEvents(mX); mY = sanitizeRpeEvents(mY);
+  sX = sanitizeRpeEvents(sX); sY = sanitizeRpeEvents(sY);
+  rot = sanitizeRpeEvents(rot); 
+  const speedEvs = sanitizeRpeEvents(speed);
+  const longEnd = [9999999, 0, 1];
+  return {
+    Group: 0,
+    Name: '噪域' + ((o.index != null) ? ('#' + (o.index + 1)) : ''),
+    Texture: a.subtract ? 'isSubtract1.png' : 'isSubtract0.png',
+    alphaControl: [{ x: 0, alpha: 1, easing: 1 }, { x: 9999999, alpha: 1, easing: 1 }],
+    anchor: [anchor[0], anchor[1]],
+    bpmfactor: 1,
+    eventLayers: [{
+      alphaEvents: [{ startTime: beatTriple(0), endTime: longEnd, start: 255, end: 255,
+                      easingType: 1, bezier: 0, bezierPoints: [0, 0, 0, 0], easingLeft: 0, easingRight: 1, linkgroup: 0 }],
+      moveXEvents: mX, moveYEvents: mY, rotateEvents: rot, speedEvents: speedEvs,
+    }],
+    extended: { inclineEvents: [], scaleXEvents: sX, scaleYEvents: sY },
+    father: father,
+    isCover: 1, isGif: 0, numOfNotes: 0,
+    posControl: [{ x: 0, pos: 1, easing: 1 }, { x: 9999999, pos: 1, easing: 1 }],
+    sizeControl: [{ x: 0, size: 1, easing: 1 }, { x: 9999999, size: 1, easing: 1 }],
+    skewControl: [{ x: 0, skew: 0, easing: 1 }, { x: 9999999, skew: 0, easing: 1 }],
+    yControl: [{ x: 0, y: 1, easing: 1 }, { x: 9999999, y: 1, easing: 1 }],
+    zOrder: 0,
+  };
+}
+
+/** 把 S.areas 反向写成 RPE 判定线，合并进一份 RPE 谱面（原噪域线全部替换）。
+ *  · 源谱里旧的 Line2Area 线（Texture=isSubtract*）先删掉 → 用当前噪域重建；
+ *  · 删行会让下标位移，所以保留下来的判定线要**重映射 father**；
+ *  · 噪域的父线若指向被删掉的噪域线 → 这条噪域改走烘焙（father=-1，世界坐标）。
+ *  返回新对象（不改入参 doc）。 */
+function rpeWithNoiseLines(doc, lines, areas, opts) {
+  const o = opts || {};
+  const src = (doc && doc.judgeLineList) || [];
+  const kept = [];
+  const oldToNew = new Map();
+  for (let i = 0; i < src.length; i++) {
+    if (recorderSubtractOf(src[i] && src[i].Texture) >= 0) continue;   // 旧噪域线丢弃
+    oldToNew.set(i, kept.length);
+    kept.push(src[i]);
+  }
+  const outLines = kept.map((L) => {
+    const f = (L && L.father == null) ? -1 : L.father;
+    const nf = (f >= 0 && oldToNew.has(f)) ? oldToNew.get(f) : -1;
+    return (nf === f) ? L : Object.assign({}, L, { father: nf });
+  });
+  (areas || []).forEach((a, ai) => {
+    let father = -1, forceBake = false;
+    if (a && a.parentLine) {
+      const oi = lines ? lines.indexOf(a.parentLine) : -1;
+      if (oi >= 0 && oldToNew.has(oi)) father = oldToNew.get(oi);
+      else forceBake = true;                          // 父线不在保留列表（或是被重建的噪域线）→ 烘焙
+    }
+    const ln = areaToRecorderLine(a, {
+      father, forceBake, index: ai,
+      chartEnd: o.chartEnd, aspect: o.aspect,
+    });
+    if (ln) outLines.push(ln);
+  });
+  return Object.assign({}, doc, { judgeLineList: outLines });
+}
+
 
 /** pez 的 info.txt（对照 WATER.pez / the world of scarlet 两个示例）：
  *   · 行尾是 CRLF（示例原始字节以 23 0d 0a 开头）
@@ -3193,7 +3514,7 @@ const CORE = {
   overlayEvents,
   lineStateAt,
   pezInfoTxt,
-  recorderSubtractOf, recorderLifeCycle, recorderLineToArea, HEIGHT_RATIO, SPEED_RATIO_RPE, FADEOUT_TIME, ABOVE_SIGN, NOTE_WIDTH_RATIO_BASE, NOTE_W_RPE, kRpePerBeat, lineEvents, buildLines, buildFloor, floorAt,
+  recorderSubtractOf, recorderLifeCycle, recorderLineToArea, areaToRecorderLine, rpeWithNoiseLines, HEIGHT_RATIO, SPEED_RATIO_RPE, FADEOUT_TIME, ABOVE_SIGN, NOTE_WIDTH_RATIO_BASE, NOTE_W_RPE, kRpePerBeat, lineEvents, buildLines, buildFloor, floorAt,
   kRpeFactor, isMultiBpm, bpmAt, floorTimeBetween,
 };
 /* ============================================================================
@@ -3214,7 +3535,7 @@ const S = {
   snapN: 4, pxPerBeat: 60, tlB0: 0, tlH: 0,
   pending: null,                  // {track, start, end} 等待事件尾
   now: null,                      // 预览框当前值 {centerX..}（拖拽/输入产生，未同步到事件）
-  undo: [], redo: [], rev: 0, liveEdit: false, machineTruth: false,
+  undo: [], redo: [], rev: 0, liveEdit: false, machineTruth: false, rpeNoiseLines: false,
   filter: '', onlyActive: false, showNotes: false, showAreaIdx: false, showMh: true, notes: [],
   drag: null, lastFrame: 0, tlMouse: null, listScroll: 0, tlDrag: null,
   audioManual: false,          // 音频是否由用户手动载入（手动优先于「从 RPE 目录自动挂」）
@@ -3420,21 +3741,36 @@ function makeArea(tBeat) {
   return CORE.newArea(tracks, false, 0, 0, true);
 }
 
-function buildRpeObj() {                       // 供「导出下载」和「写回目录」共用
+function buildRpeObj() {                       // 供「导出 RPE」「写回目录」「RPE pez」共用
   if (!S.doc) return null;
-  S.doc.blockAreaList = CORE.toOfficial(S.areas, S.bpm, S.aspect, S.bpm.beat(S.total))   // ★ 官方形状：RPE Recorder 读的就是它（已过官谱 14355 条往返恒等判据）
-  return S.doc;
+  const chartEnd = S.bpm.beat(S.total);
+  let obj = S.doc;
+  // ★ 可选：把当前噪域【反向写成 Line2Area 判定线】并替换谱里旧的噪域线
+  //   （S.rpeNoiseLines = 「RPE 含噪域线」开关）。写的是新对象，不改内存里的 S.doc。
+  if (S.rpeNoiseLines) {
+    obj = CORE.rpeWithNoiseLines(S.doc, S.lines, S.areas, { chartEnd: chartEnd, aspect: S.aspect });
+  }
+  obj = Object.assign({}, obj);
+  // ★ 官方形状：RPE Recorder 读的就是它（已过官谱 14355 条往返恒等判据）
+  obj.blockAreaList = CORE.toOfficial(S.areas, S.bpm, S.aspect, chartEnd);
+  return obj;
+}
+/** 当前导出对象里 Line2Area（Texture=isSubtract*）判定线的条数（状态提示用） */
+function rpeNoiseLineCount(obj) {
+  return (((obj && obj.judgeLineList) || [])).filter(l => CORE.recorderSubtractOf(l && l.Texture) >= 0).length;
 }
 function exportRpe() {
   if (!S.doc) return status('尚未载入谱面', 2500);
-  S.doc.blockAreaList = CORE.toOfficial(S.areas, S.bpm, S.aspect, S.bpm.beat(S.total))   // ★ 官方形状：RPE Recorder 读的就是它（已过官谱 14355 条往返恒等判据）
-  const blob = new Blob([JSON.stringify(S.doc)], { type: 'application/json' });
+  const obj = buildRpeObj();
+  if (!obj) return status('尚未载入谱面', 2500);
+  const blob = new Blob([JSON.stringify(obj)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = (S.docName || 'chart').replace(/\.json$/i, '') + '.json';
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-  status(`已导出 ${S.areas.length} 个噪域`, 3000);
+  status(`已导出 ${S.areas.length} 个噪域`
+    + (S.rpeNoiseLines ? `（含 ${rpeNoiseLineCount(obj)} 条 Line2Area 判定线）` : ''), 4000);
 }
 
 function computeTotal() {
@@ -4545,7 +4881,7 @@ const MENU_CATS = [
   { id: 'noise', label: '噪域信息管理', hint: '新建 · 速查 · 统计', ids: ['btnAdd', 'btnHelp'],
     note: '＋ = 在播放头处新建噪域；复制/删除噪域在面板上方的「事件」栏。' },
   { id: 'export', label: '导出功能', hint: '官方 / RPE / pez',
-    ids: ['btnExpAreaList', 'btnExportPhi', 'btnExport', 'btnExportPez', 'btnExpRpePez'],
+    ids: ['btnExpAreaList', 'btnExportPhi', 'btnExport', 'btnExportPez', 'btnExpRpePez', 'lblRpeLines'],
     note: '★「仅导出噪域数据」是主路径：只输出官方 blockAreaList.json，给 RPE Recorder 原生读噪域。' },
   { id: 'batch', label: '批量编辑', hint: '多选 · 克隆到其它噪域', ids: ['btnBatch'],
     note: '批量编辑：拖动多选事件，或把选中事件克隆到其它噪域。' },
@@ -6656,7 +6992,8 @@ async function writeToRpeDir() {
     await w.write(text);
     await w.close();
   } catch (e) { return status('写入失败：' + e.message, 5000); }
-  status('已写回 ' + target + '（' + S.areas.length + ' 个噪域，官方 blockAreaList）', 8000);
+  status('已写回 ' + target + '（' + S.areas.length + ' 个噪域，官方 blockAreaList'
+    + (S.rpeNoiseLines ? ' + ' + rpeNoiseLineCount(obj) + ' 条 Line2Area 判定线' : '') + '）', 8000);
 }
 
 /* ---------- 仅导出噪域数据：官方格式 blockAreaList.json ----------
@@ -6736,6 +7073,17 @@ async function exportRpePezPlain() {
          (removed ? '，已去掉 ' + removed + ' 条噪域判定线' : '') + '）', 6000);
 }
 document.getElementById('btnExpRpePez').onclick = exportRpePezPlain;
+/* 「RPE 含噪域线」开关：只影响 buildRpeObj（导出 RPE / 写回目录）。
+   ★ RPE 播放器把噪域线当普通判定线画 —— 只有 RPE Recorder / Phira Pro 这类认 Line2Area 的渲染器才该开。 */
+{
+  const chk = document.getElementById('chkRpeLines');
+  if (chk) chk.addEventListener('change', (e) => {
+    S.rpeNoiseLines = !!e.target.checked;
+    status(S.rpeNoiseLines
+      ? 'RPE 导出：噪域将写成 Line2Area 判定线（isSubtract*.png + speed 道生命周期 + 归一化 anchor）'
+      : 'RPE 导出：噪域只走 blockAreaList（不生成噪域判定线）', 5000);
+  });
+}
 document.getElementById('btnExpAreaList').onclick = exportAreaList;
 document.getElementById('btnWriteDir').onclick = writeToRpeDir;
 

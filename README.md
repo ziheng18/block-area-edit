@@ -23,6 +23,10 @@
 - **RPE 噪域可直接导入**：支持 B 站 **@不会特效の点缀星空** 给出的 **Line2Area 协议** ——
   用 `Texture = isSubtract0/1.png` 的判定线承载噪域（其上音符不渲染），
   这类 RPE 噪域谱面**可直接导入**本编辑器继续编辑。**暂不支持彩色噪域**。
+- **RPE 噪域可反向导出（可选）**：导出功能里勾选「**RPE 含噪域线**」后，「导出 RPE / 写回目录」
+  会把每个噪域写成 **Line2Area 判定线**（`Texture = isSubtract0/1.png`、生命周期走速度道 `1/2/3/4`、
+  `anchor` 为贴图归一化支点）。给 **RPE Recorder / Phira Pro** 这类认该约定的渲染器用；
+  普通 RPE 播放器会把噪域线当普通判定线画，**默认关闭**。
 - **适配 RPE Recorder**：把「**仅导出噪域数据**」得到的 json 放进 **RPE Recorder 的 `file` 文件夹**即可读取。
 - **官方噪域格式：导入 / 导出双向兼容** —— 可读入官方谱面里已有的 `blockAreaList` 继续编辑。
 
@@ -36,6 +40,7 @@
    - 「**导出 pez**」→ 打包成 `.pez`（谱面 + 音乐 + 插图 + `info.txt`），可直接丢给 Phira
    - 「**仅导出噪域数据**」→ 输出**标准官谱结构** `blockAreaList.json`
      （顶层键与官谱一致 `formatVersion / offset / judgeLineList / blockAreaList`，`judgeLineList` 为**空数组** = 没有判定线）
+   - 「**导出 RPE**」（勾选导出功能里的「**RPE 含噪域线**」）→ RPE 格式 `json`，噪域写成 **Line2Area 判定线**
 
 ## 支持的输入（一律按内容识别，按钮只是提示）
 
