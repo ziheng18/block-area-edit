@@ -74,6 +74,8 @@
    - 「**仅导出噪域数据**」→ 输出**标准官谱结构** `blockAreaList.json`
      （顶层键与官谱一致 `formatVersion / offset / judgeLineList / blockAreaList`，`judgeLineList` 为**空数组** = 没有判定线）
    - 「**导出 RPE**」→ RPE 格式 `json`，噪域只走官方 `blockAreaList`（不生成噪域判定线）
+- 「**导出 RPE Next**」→ RPE Next 格式 `json`（`RPEVersion 220` + 原生 `blockAreaList` 噪域，不带 carrier/Line2Area 线）
+- 「**导出 RPE Next pez**」→ 同为 RPE Next 原生格式的 `.pez`（含音乐/插图）
    - 「**导出 RPE pez（含噪域线）**」→ RPE 格式 `.pez`，噪域写成 **Line2Area 判定线**
      （给 RPE Recorder / Phira Pro；彩色噪域颜色、合并、zOrder 遮挡都在）
 

@@ -165,6 +165,8 @@
     <button id="btnExpAreaList" title="仅导出噪域数据：**标准官谱结构**（formatVersion/offset/judgeLineList:[]/blockAreaList），文件名 blockAreaList.json —— RPE Recorder 原生适配官谱噪域">仅导出噪域数据</button>
     <button id="btnExpRpePez" title="导出 RPE 格式 pez（含 blockAreaList，但去掉所有噪域判定线，不带噪域贴图）">导出 RPE pez（无噪域线）</button>
   <button id="btnExpRpePezNoise" title="导出 RPE 格式 pez（含噪域判定线：Line2Area 生命周期 / 彩色噪域颜色事件 / 合并 / zOrder 遮挡都在；给 RPE Recorder / Phira Pro 用）">导出 RPE pez（含噪域线）</button>
+  <button id="btnExpRpeNext" title="导出 RPE Next 格式谱面：META.RPEVersion=220 + 原生 blockAreaList 噪域（bottomLeft/topRight + Beat + move/rotate/scale 轨），不含 carrier/Line2Area 噪域线">导出 RPE Next</button>
+  <button id="btnExpRpeNextPez" title="打包为 RPE Next 格式 pez（RPEVersion 220 + 原生 blockAreaList 噪域；无 carrier/Line2Area 噪域线）">导出 RPE Next pez</button>
     <button id="btnWriteDir" title="选择 RPE 谱面目录，直接写回其中的谱面 json">写回 RPE 目录</button>
     <label class="chk" title="勾选后：预览拖拽/改值【立即写入事件】，不再需要点 ⟲（是否出现/是否生效不受影响）"><input type="checkbox" id="chkLive"> 即时修改</label>
     <label class="chk" id="lblImgCols" title="横向网格数，越大越细">精细度 <input type="number" id="imgCols" value="48" min="8" max="200" step="8" style="width:52px"></label>
@@ -5148,6 +5150,7 @@ function makeArea(tBeat) {
 function buildRpeObj(opts) {                    // 供「导出 RPE」「写回目录」「RPE pez」共用
   const withNoise = !!(opts && opts.noiseLines);
   const keepNoise = !!(opts && opts.keepNoiseLines);
+  const explicitNext = !!(opts && opts.nextFormat);   // 「导出 RPE Next」强制 RPE Next 原生格式
   if (!S.doc && !S.srcDoc) return null;
   const chartEnd = S.bpm.beat(S.total);
   // ★ 官方来源：S.doc 只是空壳（judgeLineList: []）→ 必须先转成 RPE 骨架
@@ -5182,14 +5185,15 @@ function buildRpeObj(opts) {                    // 供「导出 RPE」「写回�
   //   · RPEVersion 写成 220（RPE Next 格式版本）；
   //   · 去掉所有 carrier/Line2Area 噪域线（噪域只在 blockAreaList 里）；
   //   · blockAreaList 优先原样保留（未编辑），编辑过再用 nextBlockAreas() 重建。
-  const srcNext = !!(S.format === 'rpe' && S.doc && CORE.isRpeNextDoc(S.doc));
+  const rawNextSrc = !!(S.format === 'rpe' && S.doc && CORE.isRpeNextDoc(S.doc));
+  const srcNext = explicitNext || rawNextSrc;
   if (srcNext) {
     obj.META = Object.assign({}, obj.META || {}, { RPEVersion: 220 });
     obj.judgeLineList = (obj.judgeLineList || []).filter(L => CORE.recorderSubtractOf(L && L.Texture) < 0);
   }
   // ★ 普通 RPE 的 blockAreaList 也统一写 next schema；native 官谱形状只用于
   //   「导出官方 / 官方 pez / 仅导出噪域数据」（RPE Recorder 的原生官谱噪域入口）。
-  const keepRawNext = srcNext && !S.areasDirty &&
+  const keepRawNext = rawNextSrc && !S.areasDirty &&
     Array.isArray(S.doc.blockAreaList) && S.doc.blockAreaList.length;
   obj.blockAreaList = keepRawNext
     ? JSON.parse(JSON.stringify(S.doc.blockAreaList))
@@ -5213,6 +5217,18 @@ function exportRpe() {
   status(`已导出 ${S.areas.length} 个噪域`
     + (S.format !== 'rpe' ? '（官方谱已转 RPE：判定线 + 音符）' : '')
     + '；噪域只走 blockAreaList（要含 Line2Area 判定线请用「导出 RPE pez（含噪域线）」）', 6000);
+}
+
+function exportRpeNext() {
+  if (!S.doc && !S.srcDoc) return status('尚未载入谱面', 2500);
+  const obj = buildRpeObj({ nextFormat: true });
+  if (!obj) return status('尚未载入谱面', 2500);
+  const name = (S.docName || 'chart').replace(/\.json$/i, '') + '.rpe-next.json';
+  download(new Blob([JSON.stringify(obj)], { type: 'application/json' }), name);
+  status('已导出 RPE Next 格式谱面：' + name
+    + '（RPEVersion ' + ((obj.META && obj.META.RPEVersion) || 220)
+    + ' / ' + ((obj.judgeLineList || []).length) + ' 条判定线 / '
+    + ((obj.blockAreaList || []).length) + ' 个噪域；噪域只走 blockAreaList，无 carrier 线）', 9000);
 }
 
 function computeTotal() {
@@ -6391,7 +6407,7 @@ const MENU_CATS = [
   { id: 'noise', label: '噪域信息管理', hint: '新建 · 速查 · 统计', ids: ['btnAdd', 'btnHelp'],
     note: '＋ = 在播放头处新建噪域；复制/删除噪域在面板上方的「事件」栏。' },
   { id: 'export', label: '导出功能', hint: '官方 / RPE / pez',
-    ids: ['btnExpAreaList', 'btnExportPhi', 'btnExport', 'btnExportPez', 'btnExpRpePez', 'btnExpRpePezNoise'],
+    ids: ['btnExpAreaList', 'btnExportPhi', 'btnExport', 'btnExportPez', 'btnExpRpePez', 'btnExpRpePezNoise', 'btnExpRpeNext', 'btnExpRpeNextPez'],
     note: '★「仅导出噪域数据」是主路径：只输出官方 blockAreaList.json，给 RPE Recorder 原生读噪域。' },
   { id: 'batch', label: '批量编辑', hint: '多选 · 克隆到其它噪域', ids: ['btnBatch'],
     note: '批量编辑：拖动多选事件，或把选中事件克隆到其它噪域。' },
@@ -8617,8 +8633,9 @@ async function exportAreaList() {
    · 把所有噪域判定线（Texture = isSubtract0/1.png）过滤掉
    · 不带 isSubtract0/1.png 贴图
    给「原生适配官谱噪域」的渲染器用：噪域走 blockAreaList，判定线列表保持干净。 */
-async function exportRpePezMode(includeNoise) {
+async function exportRpePezMode(includeNoise, nextFormat) {
   const withNoise = !!includeNoise;
+  const explicitNext = !!nextFormat;
   const rec = rpeCharts[rpeIdx];
   const bytes = async (x) => new Uint8Array(await (x.handle ? await x.handle.getFile() : x.file).arrayBuffer());
   let song = '', pic = '', musicData = null, picData = null;
@@ -8639,7 +8656,7 @@ async function exportRpePezMode(includeNoise) {
     if (!f) return status('已取消：pez 需要插图，否则 Phira 播放会报 os error 5', 6000);
     picData = new Uint8Array(await f.arrayBuffer()); pic = f.name.replace(/[\\/:*?"<>|]/g, '_');
   }
-  const o = buildRpeObj({ noiseLines: withNoise });   // RPE 格式（含 blockAreaList）
+  const o = buildRpeObj({ noiseLines: withNoise, nextFormat: explicitNext });   // RPE 格式（含 blockAreaList）
   if (!o) return status('尚未载入谱面', 2500);
   let removed = 0;
   if (!withNoise) {
@@ -8673,6 +8690,8 @@ async function exportRpePezMode(includeNoise) {
 }
 document.getElementById('btnExpRpePez').onclick = () => exportRpePezMode(false);
 document.getElementById('btnExpRpePezNoise').onclick = () => exportRpePezMode(true);
+document.getElementById('btnExpRpeNext').onclick = exportRpeNext;
+document.getElementById('btnExpRpeNextPez').onclick = () => exportRpePezMode(false, true);
 /* 「RPE 含噪域线」不再做开关：普通「导出 RPE / 写回目录」不写噪域线；
    需要 Line2Area 判定线请用「导出 RPE pez（含噪域线）」（RPE Recorder / Phira Pro 这类渲染器才认）。 */
 document.getElementById('btnExpAreaList').onclick = exportAreaList;
