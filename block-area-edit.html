@@ -2827,6 +2827,71 @@ function buildLineColorEvents(items, chartEnd) {
   return out;
 }
 
+/** RPE 导出轨规范化（用户规则）：
+ *  ① **线性拟合事件首尾相接**：两个「值在变」的事件之间若有空档，插入一段线性过渡桥，
+ *     保证每两个线性事件 end == 下一个 start；
+ *  ② **数值不变的时段**：只在段首写一条时长 ≤1/4 拍的事件（后面的读取器保持该值），
+ *     不再写一长串重复事件。
+ *  轨道可为数值（mX/mY/sX/sY/rot/speed/alpha）或颜色（colorEvents），通过 opts.eq/isConst/copy 适配。
+ *  输出仍保证无零长、无重叠。 */
+const TRACK_SHORT_MAX = 1 / 4;
+function normalizeRpeTrack(evs, opts) {
+  const o = opts || {};
+  const eq = o.eq || ((a, b) => Math.abs((+a || 0) - (+b || 0)) <= 1e-9);
+  // ★ RPE 事件的起止值字段是 start/end（不是内部模型的 a/b）
+  const isConst = o.isConst || (e => eq(e.start, e.end));
+  const copy = o.copy || (v => v);
+  const sane = sanitizeRpeEvents(evs || []);
+  const out = [];
+  const shortEv = (t0, v) => ({
+    startTime: beatTriple(t0), endTime: beatTriple(t0 + Math.max(1 / 480, TRACK_SHORT_MAX)),
+    start: copy(v), end: copy(v),
+    easingType: 1, bezier: 0, bezierPoints: [0, 0, 0, 0], easingLeft: 0, easingRight: 1, linkgroup: 0,
+  });
+  let lastLinEnd = null, lastLinB = null;
+  let i = 0;
+  while (i < sane.length) {
+    const e = sane[i];
+    const t0 = tripleToBeats(e.startTime), t1 = tripleToBeats(e.endTime);
+    if (!isConst(e)) {
+      // 线性事件：与上一个线性事件之间空档 → 用线性过渡桥接，保证首尾相接
+      if (lastLinEnd != null && t0 > lastLinEnd + 1e-9) {
+        out.push({
+          startTime: beatTriple(lastLinEnd), endTime: beatTriple(t0),
+          start: lastLinB, end: copy(e.start),
+          easingType: 1, bezier: 0, bezierPoints: [0, 0, 0, 0], easingLeft: 0, easingRight: 1, linkgroup: 0,
+        });
+      }
+      out.push(e);
+      lastLinEnd = t1; lastLinB = e.end;
+      i++;
+      continue;
+    }
+    // 常值段：合并「同值 + 中间没有别的值」的连续事件（含空档保持），只写段首一条短事件
+    let v = e.start, runEnd = t1, j = i + 1;
+    while (j < sane.length) {
+      const n = sane[j];
+      if (!isConst(n) || !eq(n.start, v)) break;
+      runEnd = tripleToBeats(n.endTime);
+      j++;
+    }
+    let dur = Math.min(TRACK_SHORT_MAX, runEnd - t0);
+    const nextStart = (j < sane.length) ? tripleToBeats(sane[j].startTime) : Infinity;
+    if (isFinite(nextStart)) dur = Math.min(dur, nextStart - t0);
+    if (!(dur > 1e-9)) dur = 1 / 480;
+    const ev = shortEv(t0, v);
+    ev.endTime = beatTriple(t0 + Math.max(1 / 480, dur));
+    out.push(ev);
+    lastLinEnd = null; lastLinB = null;   // 短事件后是“保持值”的时段，不参与线性桥接
+    i = j;
+  }
+  return sanitizeRpeEvents(out);
+}
+/** 颜色轨规范化（颜色数组） */
+function normalizeColorTrack(evs) {
+  return normalizeRpeTrack(evs, { eq: colorEq, isConst: e => colorEq(e.start, e.end), copy: colorCopy });
+}
+
 /** 组装一条 Line2Area 噪域判定线（单区导出 / 合并导出共用）。
  *  兜底默认值与 areaState 一致：中心=0、宽=RPE_WIDTH、高=RPE_HEIGHT、旋转=0；
  *  最终 sanitize：零长/负长/重叠一律不写。 */
@@ -2837,15 +2902,16 @@ function makeNoiseLine(p) {
                         easingLeft: 0, easingRight: 1, linkgroup: 0 }];
   const fix = (arr, def) => {
     const sane = sanitizeRpeEvents((arr && arr.length) ? arr : one(def));
-    return sane.length ? sane : one(def);
+    return normalizeRpeTrack(sane.length ? sane : one(def));
   };
   const mX = fix(p.mX, p.defX || 0);
   const mY = fix(p.mY, p.defY || 0);
   const sX = fix(p.sX, p.defW == null ? encScale(RPE_WIDTH) : p.defW);
   const sY = fix(p.sY, p.defH == null ? encScale(RPE_HEIGHT) : p.defH);
   const rot = fix(p.rot, 0);
-  const speedEvs = sanitizeRpeEvents(p.speed || []);
-  const alphaEvs = sanitizeRpeEvents(p.alpha || []);
+  const speedEvs = normalizeRpeTrack(sanitizeRpeEvents(p.speed || []));
+  const alphaEvs = normalizeRpeTrack(sanitizeRpeEvents(p.alpha || []));
+  const colorEvs = normalizeColorTrack(p.colorEvents || []);
   const anchor = p.anchor || [0.5, 0.5];
   const longEnd = [9999999, 0, 1];
   return {
@@ -2860,7 +2926,7 @@ function makeNoiseLine(p) {
                       easingType: 1, bezier: 0, bezierPoints: [0, 0, 0, 0], easingLeft: 0, easingRight: 1, linkgroup: 0 }],
       moveXEvents: mX, moveYEvents: mY, rotateEvents: rot, speedEvents: speedEvs,
     }],
-    extended: { colorEvents: (p.colorEvents || []).slice(), inclineEvents: [], scaleXEvents: sX, scaleYEvents: sY },
+    extended: { colorEvents: colorEvs, inclineEvents: [], scaleXEvents: sX, scaleYEvents: sY },
     father: (p.father == null ? -1 : p.father),
     isCover: 1, isGif: false, numOfNotes: 0,
     posControl: [{ x: 0, pos: 1, easing: 1 }, { x: 9999999, pos: 1, easing: 1 }],
@@ -4555,7 +4621,7 @@ NOISE_DEFAULT_COLOR, isColorVal, colorFromAny, colorCopy, colorEq, colorHex, col
   lineStateAt,
   pezInfoTxt,
   recorderSubtractOf, recorderLifeCycle, recorderLineToArea, areaToRecorderLine, rpeWithNoiseLines,
- packNoiseAreas, packLowerBound, areaSpans, rpeFromOfficial, lifeToSpeedEvents, lifeToAlphaEvents, lifeTransitions, HEIGHT_RATIO, SPEED_RATIO_RPE, FADEOUT_TIME, ABOVE_SIGN, NOTE_WIDTH_RATIO_BASE, NOTE_W_RPE, kRpePerBeat, lineEvents, buildLines, buildFloor, floorAt,
+ packNoiseAreas, packLowerBound, areaSpans, rpeFromOfficial, lifeToSpeedEvents, lifeToAlphaEvents, lifeTransitions, normalizeRpeTrack, normalizeColorTrack, HEIGHT_RATIO, SPEED_RATIO_RPE, FADEOUT_TIME, ABOVE_SIGN, NOTE_WIDTH_RATIO_BASE, NOTE_W_RPE, kRpePerBeat, lineEvents, buildLines, buildFloor, floorAt,
   kRpeFactor, isMultiBpm, bpmAt, floorTimeBetween,
 };
 /* ============================================================================
