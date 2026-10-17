@@ -2280,13 +2280,16 @@ function lifeToSpeedEvents(T, chartEnd) {
   const lifeTriple = (t) => { const q = qt(t); return q === 0 ? [0, 0, 1] : beatsToTriple(q, QD); };
   const addTimes = (out, track) => {
     // ★ 用【原始时间】求值，只在记录变化时量化：
-    //   先量化再求值会让 0.1250000057 这类事件起点被量化到 0.125（比真实起点早 5e-9），
-    //   evalBool 在 0.125 处仍判定"未出现"，整条线的第一个 1/2 会被推迟到下一个窗口（实测）。
-    for (const e of (track || [])) for (const t of [e.start, e.end]) if (isFinite(t)) out.push(+Math.max(0, t).toFixed(9));
+    //   1) 不能先量化再求值：0.1250000057 的事件起点被量化到 0.125（早 5e-9）会判"未出现"；
+    //   2) 也不能 toFixed(9)：6.0000001425 会被截成 6.000000142（早 5e-10），
+    //      导致 6→44 这一整段被判为未出现、速度写成 4（噪域#2 实测）。
+    for (const e of (track || [])) for (const t of [e.start, e.end]) if (isFinite(t)) out.push(Math.max(0, +t));
   };
   const ts = [];
   addTimes(ts, T.visible); addTimes(ts, T.active);
-  const times = [...new Set(ts)].sort((x, y) => x - y);
+  ts.sort((x, y) => x - y);
+  const times = [];
+  for (const t of ts) if (!times.length || t - times[times.length - 1] > 1e-12) times.push(t);
   if (!times.length) return [];
   const changes = [];
   let curV = false, curA = false;
