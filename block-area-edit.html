@@ -1868,6 +1868,180 @@ function fromV2(list, bpm) {
   });
 }
 
+/* -------------------- RPE Next（RPEVersion ≥ 220）噪域 --------------------
+   RPE Next 的 blockAreaList 使用另一套 schema：
+     { bottomLeft:{x,y}, topRight:{x,y}, appearTime:Beat, disappearTime:Beat,
+       activeIntervals:[{startTime,endTime,readyFlash}], isInvert,
+       moveXEvents, moveYEvents, rotateEvents, scaleXEvents, scaleYEvents }
+   坐标是 RPE 画布单位（不是百分比），时间全是 Beat；事件没有 endTime? 有 startTime/endTime。
+   旧版 fromV2 会把这种数据当成"内部 v2 JSON"解析 → 几何/事件全错，随后导出时
+   blockAreaList[0] 的坐标变成缺省/NaN（外部校验器会报 bottomLeft 非有限）。 */
+function isNextBlockEntry(a) {
+  return !!(a && (a.bottomLeft || a.topRight) && !a.bottomLeftPercentage &&
+    ('isInvert' in a || 'activeIntervals' in a || 'moveXEvents' in a || 'scaleXEvents' in a));
+}
+function isRpeNextDoc(doc) {
+  if (!doc || typeof doc !== 'object') return false;
+  const b = doc.blockAreaList;
+  if (Array.isArray(b) && b.length) {
+    if (isNextBlockEntry(b[0])) return true;
+    if (b[0] && b[0].bottomLeftPercentage) return false;
+  }
+  const v = doc.META && +doc.META.RPEVersion;
+  return !!(isFinite(v) && v >= 220);
+}
+const NEXT_EPS = 1e-7;
+function fromNextBlockAreas(list, bpm) {
+  const bt = (v) => Array.isArray(v) ? tripleToBeats(v) : 0;
+  const num = (v, d) => isFinite(+v) ? +v : d;
+  const mkTrack = (arr, conv, def, lifeStart, lifeEnd) => {
+    const out = [];
+    for (const e of (arr || [])) {
+      let s = bt(e && e.startTime), en = bt(e && e.endTime);
+      let a = conv(e && e.start), b = conv(e && e.end);
+      if (!isFinite(s) || !isFinite(en) || en <= s + NEXT_EPS) continue;
+      if (!isFinite(a) || !isFinite(b)) continue;
+      const o = { start: s, end: en, a, b, easing: num(e.easingType, 1) || 1 };
+      if (e.easingLeft != null || e.easingRight != null) { o.ezL = num(e.easingLeft, 0); o.ezR = num(e.easingRight, 1); }
+      if (e.bezier && Array.isArray(e.bezierPoints) && e.bezierPoints.length === 4) o.bez = e.bezierPoints.slice();
+      out.push(o);
+    }
+    out.sort((p, q) => p.start - q.start);
+    if (!out.length && lifeEnd > lifeStart + NEXT_EPS) out.push({ start: lifeStart, end: lifeEnd, a: def, b: def, easing: 1 });
+    return out;
+  };
+  return (list || []).filter(isNextBlockEntry).map(a => {
+    const bl = a.bottomLeft || { x: 0, y: 0 }, tr = a.topRight || { x: 1, y: 1 };
+    const x0 = num(bl.x, 0), x1 = num(tr.x, 1), y0 = num(bl.y, 0), y1 = num(tr.y, 1);
+    const bcx = (x0 + x1) / 2, bcy = (y0 + y1) / 2;
+    const w0 = Math.max(1e-6, Math.abs(x1 - x0)), h0 = Math.max(1e-6, Math.abs(y1 - y0));
+    let lifeStart = bt(a.appearTime), lifeEnd = bt(a.disappearTime);
+    if (!isFinite(lifeStart)) lifeStart = 0;
+    if (!isFinite(lifeEnd) || lifeEnd <= lifeStart + NEXT_EPS) lifeEnd = lifeStart + 1;
+    const tracks = emptyTracks();
+    tracks.centerX = mkTrack(a.moveXEvents, v => num(v, bcx), bcx, lifeStart, lifeEnd);
+    tracks.centerY = mkTrack(a.moveYEvents, v => num(v, bcy), bcy, lifeStart, lifeEnd);
+    tracks.width = mkTrack(a.scaleXEvents, v => w0 * num(v, 1), w0, lifeStart, lifeEnd);
+    tracks.height = mkTrack(a.scaleYEvents, v => h0 * num(v, 1), h0, lifeStart, lifeEnd);
+    tracks.rotation = mkTrack(a.rotateEvents, v => num(v, 0), 0, lifeStart, lifeEnd);
+    tracks.visible = boolSpan(lifeStart, lifeEnd);
+    const ivs = (a.activeIntervals || []).map(i => [bt(i.startTime), bt(i.endTime)])
+      .filter(([s, e]) => isFinite(s) && isFinite(e) && e > s + NEXT_EPS)
+      .sort((p, q) => p[0] - q[0]);
+    const merged = [];
+    for (const iv of ivs) {
+      const last = merged[merged.length - 1];
+      if (last && iv[0] <= last[1] + NEXT_EPS) last[1] = Math.max(last[1], iv[1]); else merged.push(iv.slice());
+    }
+    tracks.active = [];
+    for (const [s, e] of merged) {
+      tracks.active.push({ start: s, end: e, a: true, b: true, easing: 1 });
+      tracks.active.push({ start: e, end: Math.max(e + 1 / 480, lifeEnd), a: false, b: false, easing: 1 });
+    }
+    // 重排成 true→false 交替（重叠已合并）
+    tracks.active.sort((p, q) => p.start - q.start);
+    const clean = [];
+    for (const ev of tracks.active) {
+      const last = clean[clean.length - 1];
+      if (last && (last.a === ev.a || ev.start < last.start + NEXT_EPS)) continue;
+      clean.push(ev);
+    }
+    tracks.active = clean;
+    // 用「简单模式」：内部 center 轨就是渲染中心，避免 anchorDisp 再叠一次。
+    const na = newArea(tracks, !!a.isInvert, bcx, bcy, true, 'abs');
+    return na;
+  });
+}
+/** 内部噪域 → RPE Next blockAreaList（坐标 RPE 单位、时间 Beat）。 */
+function nextBlockAreas(areas, bpm, chartEnd, aspect) {
+  const A = aspect || DEFAULT_ASPECT;
+  const out = [];
+  const tri = (t) => beatTriple(Math.max(0, +t || 0));
+  const num = (v, d) => isFinite(+v) ? +v : d;
+  const visSpans = (a) => {
+    const T = (a && a.tracks) || a || {};
+    const spans = []; let cur = null;
+    for (const e of (T.visible || [])) {
+      if (e.a && cur == null) cur = e.start;
+      if (!e.a && cur != null) { const s = Math.max(0, cur), en = Math.min(chartEnd, e.start); if (en > s + 1e-9) spans.push([s, en]); cur = null; }
+    }
+    if (cur != null) { const s = Math.max(0, cur), en = chartEnd; if (en > s + 1e-9) spans.push([s, en]); }
+    return spans;
+  };
+  const actSpans = (a) => {
+    const T = (a && a.tracks) || a || {};
+    const spans = []; let cur = null;
+    for (const e of (T.active || [])) {
+      if (e.a && cur == null) cur = e.start;
+      if (!e.a && cur != null) { const s = Math.max(0, cur), en = Math.min(chartEnd, e.start); if (en > s + 1e-9) spans.push([s, en]); cur = null; }
+    }
+    if (cur != null) { const s = Math.max(0, cur), en = chartEnd; if (en > s + 1e-9) spans.push([s, en]); }
+    return spans;
+  };
+  const mkEv = (t0, t1, v0, v1, anchor) => {
+    const o = {
+      startTime: tri(t0), endTime: tri(t1), start: v0, end: v1,
+      easingType: 1, easingLeft: 0, easingRight: 1, bezier: 0, bezierPoints: [0, 0, 1, 1],
+      inst: 0, linkgroup: 0,
+    };
+    if (anchor) o.anchor = { x: num(anchor.x, 0), y: num(anchor.y, 0) };
+    return o;
+  };
+  const mkSegs = (a, t0, t1, pick, base, anchor) => {
+    const T = (a && a.tracks) || a || {};
+    const ts = [t0, t1];
+    for (const K of ['centerX', 'centerY', 'width', 'height', 'rotation']) for (const e of (T[K] || [])) {
+      if (e.start > t0 + 1e-9 && e.start < t1 - 1e-9) ts.push(e.start);
+      if (e.end > t0 + 1e-9 && e.end < t1 - 1e-9) ts.push(e.end);
+    }
+    const uniq = [...new Set(ts.map(t => +t.toFixed(9)))].sort((x, y) => x - y);
+    const segs = [];
+    for (let i = 0; i + 1 < uniq.length; i++) {
+      const s = uniq[i], e = uniq[i + 1];
+      if (!(e > s + 1e-9)) continue;
+      const sr = areaState(a, s + NEXT_EPS, A, null);
+      const el = areaState(a, e - NEXT_EPS, A, null);
+      const v0 = pick(sr), v1 = pick(el);
+      if (!isFinite(v0) || !isFinite(v1)) continue;
+      if (Math.abs(v0 - base) < 1e-9 && Math.abs(v1 - base) < 1e-9) continue;
+      segs.push(mkEv(s, e, v0, v1, anchor));
+    }
+    return segs;
+  };
+  for (const a of (areas || [])) {
+    const T = (a && a.tracks) || a || {};
+    let spans = visSpans(a);
+    if (!spans.length) {
+      // 没有 visible 轨但有几何事件：按整张谱可见处理（与官谱导出兜底一致）
+      const hasGeom = ['centerX', 'centerY', 'width', 'height', 'rotation'].some(k => (T[k] || []).length);
+      if (hasGeom && chartEnd > 1e-6) spans = [[0, chartEnd]];
+    }
+    for (const [t0, t1] of spans) {
+      const s0 = areaState(a, t0 + NEXT_EPS, A, null);
+      const c0 = { x: num(s0.centerX, 0), y: num(s0.centerY, 0) };
+      const w0 = Math.max(1e-6, Math.abs(num(s0.width, RPE_WIDTH)) || RPE_WIDTH);
+      const h0 = Math.max(1e-6, Math.abs(num(s0.height, RPE_HEIGHT)) || RPE_HEIGHT);
+      const bl = { x: num(c0.x - w0 / 2, -RPE_WIDTH / 2), y: num(c0.y - h0 / 2, -RPE_HEIGHT / 2) };
+      const trp = { x: num(c0.x + w0 / 2, RPE_WIDTH / 2), y: num(c0.y + h0 / 2, RPE_HEIGHT / 2) };
+      const acts = actSpans(a).map(([s, e]) => ({ startTime: tri(Math.max(t0, s)), endTime: tri(Math.min(t1, e)), readyFlash: 0.5 }))
+        .filter(iv => tripleToBeats(iv.endTime) > tripleToBeats(iv.startTime) + 1e-9);
+      out.push({
+        Name: '',
+        bottomLeft: bl, topRight: trp,
+        appearTime: tri(t0), disappearTime: tri(t1),
+        activeIntervals: acts,
+        isInvert: !!a.subtract,
+        moveXEvents: mkSegs(a, t0, t1, s => num(s.centerX, c0.x), c0.x, null),
+        moveYEvents: mkSegs(a, t0, t1, s => num(s.centerY, c0.y), c0.y, null),
+        rotateEvents: mkSegs(a, t0, t1, s => num(s.rotation, 0), 0, c0),
+        scaleXEvents: mkSegs(a, t0, t1, s => num(s.width, w0) / w0, 1, c0),
+        scaleYEvents: mkSegs(a, t0, t1, s => num(s.height, h0) / h0, 1, c0),
+      });
+    }
+  }
+  return out;
+}
+
 /** 新模型的 JSON（Beat 三元组；缩放/旋转事件带 anchorX/anchorY） */
 function toJson(areas, den) {
   const T = b => bestTriple(b, den);
@@ -1945,6 +2119,7 @@ function parseAreas(raw, bpm) {
       return na;
     });
   }
+  if (isNextBlockEntry(s)) return fromNextBlockAreas(raw, bpm);
   if (s.bottomLeftPercentage) return fromOfficial(raw, bpm, (a) => !!a.isSubtract);   // ★ 补上 isSubtract
   if (s.bottomLeft) return fromV2(raw, bpm);
   return [];
@@ -3792,7 +3967,25 @@ function toOfficial(areas, bpm, aspect, chartEnd) {
     }
     for (const sp of spans) for (const w of splitByActive(sp[0], sp[1])) out.push.apply(out, toOfficialOne([a], bpm, w, aspect, chartEnd));
   }
-  return out;
+  return sanitizeBlockAreaListFinite(out);
+}
+/** 官谱 blockAreaList 兜底：任何非有限坐标都替换为安全值。
+ *  外部加载器对 NaN/Infinity 的报错通常只写 "bottomLeft 坐标必须包含有限 x/y"，
+ *  这里从源头保证导出的 native blockAreaList 不会出现 null/NaN。 */
+function sanitizeBlockAreaListFinite(list) {
+  const n = (v, d) => isFinite(+v) ? +v : d;
+  const pos = (p, dx, dy) => ({ x: n(p && p.x, dx), y: n(p && p.y, dy) });
+  for (const e of (list || [])) {
+    e.bottomLeftPercentage = pos(e.bottomLeftPercentage, 0, 0);
+    e.topRightPercentage = pos(e.topRightPercentage, 1, 1);
+    for (const k of ['appearTime', 'enableTime', 'disableTime', 'disappearTime']) e[k] = n(e[k], 0);
+    for (const ev of (e.rotateEvents || [])) {
+      ev.time = n(ev.time, 0); ev.rotation = n(ev.rotation, 0); ev.anchor = pos(ev.anchor, 0.5, 0.5);
+    }
+    for (const ev of (e.moveEvents || [])) { ev.time = n(ev.time, 0); ev.endPosition = pos(ev.endPosition, 0.5, 0.5); }
+    for (const ev of (e.scaleEvents || [])) { ev.time = n(ev.time, 0); ev.anchor = pos(ev.anchor, 0.5, 0.5); ev.scale = pos(ev.scale, 1, 1); }
+  }
+  return list;
 }
 
 /** ★ RPE 1~31 → 官方 0~14 的反向映射。
@@ -4605,7 +4798,7 @@ NOISE_DEFAULT_COLOR, isColorVal, colorFromAny, colorCopy, colorEq, colorHex, col
   bpmNormalize, bpmSetValue, bpmSetBeat, bpmAddAt, bpmRemoveAt, recLineSig, mergeNoiseFromLines, noiseStagingDoc, noiseStagingParse, NOISE_STAGING_VERSION, areasToPlain, areasFromPlain,
   unzipEntries, parseRespackInfo, respackParams, respackReadZip, respackMissing, RESPACK_TEX, frameContentFrac,
   chartToAudioSec, audioToChartSec,
-  isBlockAreaEntry, blockAreaListOf, noiseChartDoc, classifyChartJson,
+  isBlockAreaEntry, blockAreaListOf, noiseChartDoc, classifyChartJson, isNextBlockEntry, isRpeNextDoc, fromNextBlockAreas, nextBlockAreas, sanitizeBlockAreaListFinite,
   OFFICIAL_EASE_TO_RPE, OFFICIAL_EASE_ZERO, OFFICIAL_EASE_ONE, officialSeg, officialKfToEvents,
   fitRects,
   rpeToOfficialEase,
@@ -4880,7 +5073,12 @@ function buildRpeObj(opts) {                    // 供「导出 RPE」「写回�
   }
   obj = Object.assign({}, obj);
   // ★ 官方形状：RPE Recorder 读的就是它（已过官谱 14355 条往返恒等判据）
-  obj.blockAreaList = CORE.toOfficial(S.areas, S.bpm, S.aspect, chartEnd);
+  // ★ RPE Next（RPEVersion≥220）谱面必须写 next 版 blockAreaList（bottomLeft/topRight + Beat），
+  //   否则外部加载器会按 next schema 读 native 条目 → blockAreaList[0].bottomLeft 非有限坐标。
+  const nextSrc = !!(S.doc && CORE.isRpeNextDoc(S.doc));
+  obj.blockAreaList = nextSrc
+    ? CORE.nextBlockAreas(S.areas, S.bpm, chartEnd, S.aspect)
+    : CORE.toOfficial(S.areas, S.bpm, S.aspect, chartEnd);
   return obj;
 }
 /** 当前导出对象里 Line2Area（Texture=isSubtract*）判定线的条数（状态提示用） */

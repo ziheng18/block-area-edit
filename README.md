@@ -56,6 +56,9 @@
   **≤1/4 拍**的短事件（几何 / 颜色 / speed / alpha 全部适用）。
 - **适配 RPE Recorder**：把「**仅导出噪域数据**」得到的 json 放进 **RPE Recorder 的 `file` 文件夹**即可读取。
 - **官方噪域格式：导入 / 导出双向兼容** —— 可读入官方谱面里已有的 `blockAreaList` 继续编辑。
+- **RPE Next（`RPEVersion >= 220`）噪域格式**：支持 `bottomLeft`/`topRight` + `moveXEvents/...` 的 next schema 导入；
+  导出 RPE 时若源谱是 RPE Next，会写回 next schema（避免外部加载器把 native 条目当 next 读、
+  报 `blockAreaList[0].bottomLeft 坐标必须包含有限 x/y`）。
 - **官方格式「变格功能」警告**：谱面含官方格式无法表达且无法拟合的功能（彩色噪域颜色、噪域载体线音符等）时，
   导出官方 / 官方 pez / 仅噪域数据会先弹窗警告；确认后**只在导出副本上去掉这些功能**再导出
   （编辑器内颜色/事件数据不变），取消则中止。
