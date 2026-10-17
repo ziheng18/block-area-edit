@@ -5013,14 +5013,21 @@ function loadRpe(text, name) {
   S.notes = collectNotesRpe(doc);
   rebuildLines();
   // ★ 社区约定的 Recorder 噪域线 → 追加为噪域（Texture = isSubtract0/1.png）
+  const _srcNext = CORE.isRpeNextDoc(doc);
   const _rec = S.lines.filter(L => L.noise).map(L => CORE.recorderLineToArea(L, S.lines)).filter(Boolean);
-  if (_rec.length) {
+  if (_rec.length && (!_srcNext || !S.areas.length)) {
     // ★ 同一批噪域可能同时存在于两种表达里：blockAreaList（官方格式字段）和噪域判定线（Recorder 约定）。
     //   两者会被各读一遍 → 噪域数翻倍 → 导出后线数也翻倍（就是「52 根线」的来源）。
     //   噪域判定线才是这张谱面的实际表达，有它就以它为准。
     const dup = S.areas.length;
     S.areas = _rec;
     status('已识别 ' + _rec.length + ' 条 Recorder 噪域线' + (dup ? '（另有 ' + dup + ' 个 blockAreaList 噪域被判定为重复，已忽略）' : ''), 6000);
+  } else if (_srcNext && _rec.length) {
+    // ★ RPE Next：噪域的实际表达是 blockAreaList（bottomLeft/topRight），不是 Line2Area 判定线。
+    //   旧「含噪域线」导出会同时带一堆 carrier 线；导入时必须以 blockAreaList 为准，否则
+    //   编辑器只读到 carrier 线，14355 个噪域会被 1421 条线覆盖。
+    status('已识别 RPE Next 噪域：以 blockAreaList 的 ' + S.areas.length + ' 个噪域为准'
+      + '（忽略 ' + _rec.length + ' 条 carrier/噪域判定线）', 8000);
   }
   S.undo.length = 0; S.redo.length = 0; S.sel = S.areas.length ? 0 : -1; S.selEvent = null;
   computeTotal(); S.time = 0; S.rev++;
@@ -5169,13 +5176,21 @@ function buildRpeObj(opts) {                    // 供「导出 RPE」「写回�
       obj = Object.assign({}, base, { judgeLineList: jll });
   }
   obj = Object.assign({}, obj);
-  // ★ RPE 谱面的 blockAreaList：外部加载器（RPE Next / 新版 RPE 工具）按 next schema 读
-  //   （bottomLeft/topRight + Beat 三元组）。这里统一写 next schema；native 官谱形状只用于
+  // ★ RPE Next 是【原生支持噪域】的格式：blockAreaList 用 next schema（bottomLeft/topRight、
+  //   Beat 时间、activeIntervals、moveX/Y/rotate/scaleX/Y），噪域不再靠 Line2Area 判定线。
+  //   源谱是 RPE Next 时导出也必须保持这个原生格式：
+  //   · RPEVersion 写成 220（RPE Next 格式版本）；
+  //   · 去掉所有 carrier/Line2Area 噪域线（噪域只在 blockAreaList 里）；
+  //   · blockAreaList 优先原样保留（未编辑），编辑过再用 nextBlockAreas() 重建。
+  const srcNext = !!(S.format === 'rpe' && S.doc && CORE.isRpeNextDoc(S.doc));
+  if (srcNext) {
+    obj.META = Object.assign({}, obj.META || {}, { RPEVersion: 220 });
+    obj.judgeLineList = (obj.judgeLineList || []).filter(L => CORE.recorderSubtractOf(L && L.Texture) < 0);
+  }
+  // ★ 普通 RPE 的 blockAreaList 也统一写 next schema；native 官谱形状只用于
   //   「导出官方 / 官方 pez / 仅导出噪域数据」（RPE Recorder 的原生官谱噪域入口）。
-  //   若源谱本身就是 RPE Next 且噪域没被编辑过，直接原样保留它的 blockAreaList
-  //   （import → export 对 next 噪域是无损的，不经过内部近似重建）。
-  const keepRawNext = S.format === 'rpe' && S.doc && !S.areasDirty &&
-    CORE.isRpeNextDoc(S.doc) && Array.isArray(S.doc.blockAreaList) && S.doc.blockAreaList.length;
+  const keepRawNext = srcNext && !S.areasDirty &&
+    Array.isArray(S.doc.blockAreaList) && S.doc.blockAreaList.length;
   obj.blockAreaList = keepRawNext
     ? JSON.parse(JSON.stringify(S.doc.blockAreaList))
     : CORE.nextBlockAreas(S.areas, S.bpm, chartEnd, S.aspect);
